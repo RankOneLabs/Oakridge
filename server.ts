@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { serveStatic } from "hono/bun";
 import { streamSSE } from "hono/streaming";
 import { parseArgs } from "node:util";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -79,8 +80,6 @@ async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
 // === http bind (fail fast before spawning CC) ===
 
 const app = new Hono();
-
-app.get("/", (c) => c.text(`cc-deck v0 — session ${sessionId}`));
 
 app.get("/stream", (c) => {
   return streamSSE(c, async (stream) => {
@@ -263,6 +262,16 @@ app.post("/approval", async (c) => {
   pending.resolve(body.decision === "approve" ? "allow" : "deny");
   return c.json({ ok: true });
 });
+
+// === static PWA (built into pwa/dist/ via `bun run build:pwa`) ===
+
+app.use(
+  "/*",
+  serveStatic({
+    root: "./pwa/dist",
+    rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
+  }),
+);
 
 let bunServer: ReturnType<typeof Bun.serve> | null = null;
 try {

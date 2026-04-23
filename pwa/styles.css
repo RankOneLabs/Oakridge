@@ -1,0 +1,88 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #111;
+  color: #e0e0e0;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+}
+
+#app {
+  min-height: 100%;
+}
+
+.app {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 0 1rem env(safe-area-inset-bottom);
+}
+
+.top-bar {
+  position: sticky;
+  top: 0;
+  background: #111;
+  border-bottom: 1px solid #2a2a2a;
+  padding: calc(env(safe-area-inset-top) + 0.5rem) 0 0.5rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  z-index: 10;
+}
+
+.status {
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  font-weight: 500;
+}
+.status-connecting {
+  background: #3a3420;
+  color: #e6c670;
+}
+.status-connected {
+  background: #1f3a24;
+  color: #7dd890;
+}
+.status-disconnected {
+  background: #3a2020;
+  color: #e67070;
+}
+
+.event-count {
+  color: #888;
+}
+
+.events {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+}
+
+.event {
+  padding: 0.6rem 0.8rem;
+  margin: 0.4rem 0;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  background: #1a1a1a;
+}
+
+.event-id {
+  color: #666;
+  margin-right: 0.75rem;
+}
+
+.event-type {
+  color: #a0c0ff;
+}
