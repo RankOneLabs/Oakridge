@@ -1,6 +1,7 @@
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { parseArgs } from "node:util";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
@@ -47,6 +48,14 @@ interface EnvelopeEvent {
   payload: unknown;
 }
 
+type Subscriber = (evt: EnvelopeEvent) => void;
+const subscribers = new Set<Subscriber>();
+
+function subscribe(cb: Subscriber): () => void {
+  subscribers.add(cb);
+  return () => subscribers.delete(cb);
+}
+
 async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
   const evt: EnvelopeEvent = {
     id: nextId++,
@@ -56,6 +65,13 @@ async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
   };
   jsonlWriter.write(JSON.stringify(evt) + "\n");
   await jsonlWriter.flush();
+  for (const cb of subscribers) {
+    try {
+      cb(evt);
+    } catch {
+      // one subscriber's failure shouldn't affect others
+    }
+  }
   return evt;
 }
 
@@ -64,9 +80,108 @@ async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
 const app = new Hono();
 
 app.get("/", (c) => c.text(`cc-deck v0 — session ${sessionId}`));
-app.get("/stream", (c) => c.text("not implemented", 501));
-app.get("/events", (c) => c.text("not implemented", 501));
-app.post("/input", (c) => c.text("not implemented", 501));
+
+app.get("/stream", (c) => {
+  return streamSSE(c, async (stream) => {
+    const pending: EnvelopeEvent[] = [];
+    let notify: (() => void) | null = null;
+    const unsub = subscribe((evt) => {
+      pending.push(evt);
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
+    });
+
+    // 15s heartbeat so mobile carriers don't drop the connection
+    const heartbeat = setInterval(() => {
+      stream.write(": ping\n\n").catch(() => {});
+    }, 15000);
+
+    let sentUpTo = -1;
+    try {
+      // catchup: replay everything already in the JSONL
+      const contents = await readFile(jsonlPath, "utf8");
+      for (const line of contents.split("\n")) {
+        if (!line.trim()) continue;
+        const evt = JSON.parse(line) as EnvelopeEvent;
+        sentUpTo = Math.max(sentUpTo, evt.id);
+        await stream.writeSSE({
+          event: "message",
+          data: JSON.stringify(evt),
+          id: String(evt.id),
+        });
+      }
+
+      // live: drain new events as they arrive
+      while (!stream.aborted) {
+        if (pending.length === 0) {
+          await new Promise<void>((r) => {
+            notify = r;
+          });
+          continue;
+        }
+        const evt = pending.shift()!;
+        if (evt.id <= sentUpTo) continue; // dedupe against catchup
+        sentUpTo = evt.id;
+        await stream.writeSSE({
+          event: "message",
+          data: JSON.stringify(evt),
+          id: String(evt.id),
+        });
+      }
+    } finally {
+      clearInterval(heartbeat);
+      unsub();
+    }
+  });
+});
+
+app.get("/events", async (c) => {
+  const sinceRaw = c.req.query("since");
+  const since = sinceRaw !== undefined ? Number(sinceRaw) : -1;
+  if (!Number.isFinite(since)) {
+    return c.json({ error: "invalid since" }, 400);
+  }
+  const contents = await readFile(jsonlPath, "utf8");
+  const events: EnvelopeEvent[] = [];
+  for (const line of contents.split("\n")) {
+    if (!line.trim()) continue;
+    const evt = JSON.parse(line) as EnvelopeEvent;
+    if (evt.id > since) events.push(evt);
+  }
+  return c.json({ session_id: sessionId, events });
+});
+
+let inputQueue: Promise<unknown> = Promise.resolve();
+
+app.post("/input", async (c) => {
+  let body: { text?: unknown };
+  try {
+    body = (await c.req.json()) as { text?: unknown };
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (typeof body.text !== "string" || body.text.length === 0) {
+    return c.json({ error: "text must be a non-empty string" }, 400);
+  }
+  const text = body.text;
+  const task = async () => {
+    const line =
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: text },
+      }) + "\n";
+    const w = proc.stdin as import("bun").FileSink;
+    w.write(line);
+    await w.flush();
+  };
+  inputQueue = inputQueue.then(task, task);
+  await inputQueue;
+  return c.json({ ok: true });
+});
+
 app.post("/approval", (c) => c.text("not implemented", 501));
 app.post("/hook/approval", (c) => c.text("not implemented", 501));
 
@@ -75,6 +190,9 @@ try {
   server = Bun.serve({
     port,
     hostname: "0.0.0.0",
+    // SSE streams are long-lived; Bun defaults to 10s per request which
+    // drops the connection before our 15s heartbeat fires.
+    idleTimeout: 255,
     fetch: app.fetch,
   });
 } catch (err) {
@@ -96,6 +214,7 @@ const cmd = [
   "--input-format", "stream-json",
   "--output-format", "stream-json",
   "--include-hook-events",
+  "--replay-user-messages",
   "--verbose",
 ];
 
