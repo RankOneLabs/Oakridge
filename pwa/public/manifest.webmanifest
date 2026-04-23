@@ -1,0 +1,18 @@
+{
+  "name": "cc-deck",
+  "short_name": "cc-deck",
+  "description": "Mobile command center for Claude Code",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#111111",
+  "background_color": "#111111",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
