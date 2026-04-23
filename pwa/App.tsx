@@ -59,9 +59,18 @@ export function App() {
     return () => es.close();
   }, []);
 
+  const sessionStarted = events.find((e) => e.type === "session_started");
+  const sessionId = sessionStarted
+    ? (sessionStarted.payload as { sessionId?: string }).sessionId
+    : null;
+
   return (
     <div className="app">
-      <TopBar status={status} eventCount={events.length} />
+      <TopBar
+        status={status}
+        eventCount={events.length}
+        sessionId={sessionId ?? null}
+      />
       <EventList events={events} resolutions={resolutions} />
       <InputBox />
       {/* Scroll sentinel lives after InputBox so auto-scroll keeps the input
@@ -76,14 +85,21 @@ export function App() {
 function TopBar({
   status,
   eventCount,
+  sessionId,
 }: {
   status: Status;
   eventCount: number;
+  sessionId: string | null;
 }) {
   return (
     <header className="top-bar">
       <span className={`status status-${status}`}>{status}</span>
       <span className="event-count">{eventCount} events</span>
+      {sessionId && (
+        <span className="session-id" title={`session ${sessionId}`}>
+          {sessionId.slice(0, 8)}
+        </span>
+      )}
     </header>
   );
 }
@@ -452,6 +468,7 @@ function InputBox() {
           Send
         </button>
       </div>
+      <div className="input-hint">Enter to send · Shift+Enter for newline</div>
     </div>
   );
 }
