@@ -64,6 +64,25 @@ function subscribe(cb: Subscriber): () => void {
   return () => subscribers.delete(cb);
 }
 
+async function readJsonlOrEmpty(path: string): Promise<string> {
+  // The JSONL file is created lazily on the first emit. Clients hitting
+  // /stream or /events before that first emit would see ENOENT; treat that
+  // as an empty transcript rather than failing the request.
+  try {
+    return await readFile(path, "utf8");
+  } catch (err) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code: string }).code === "ENOENT"
+    ) {
+      return "";
+    }
+    throw err;
+  }
+}
+
 async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
   const evt: EnvelopeEvent = {
     id: nextId++,
@@ -125,7 +144,7 @@ app.get("/stream", (c) => {
     let sentUpTo = resumeAfter;
     try {
       // catchup: replay events from the JSONL that the client hasn't seen.
-      const contents = await readFile(jsonlPath, "utf8");
+      const contents = await readJsonlOrEmpty(jsonlPath);
       for (const line of contents.split("\n")) {
         if (!line.trim()) continue;
         let evt: EnvelopeEvent;
@@ -179,7 +198,7 @@ app.get("/events", async (c) => {
   if (!Number.isFinite(since)) {
     return c.json({ error: "invalid since" }, 400);
   }
-  const contents = await readFile(jsonlPath, "utf8");
+  const contents = await readJsonlOrEmpty(jsonlPath);
   const events: EnvelopeEvent[] = [];
   for (const line of contents.split("\n")) {
     if (!line.trim()) continue;
@@ -449,17 +468,22 @@ async function* readLines(
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  const trimCR = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        if (buf.length > 0) yield buf;
+        // Flush any pending multi-byte sequence out of the decoder before
+        // the final yield, otherwise trailing non-ASCII chars can be lost.
+        buf += decoder.decode();
+        if (buf.length > 0) yield trimCR(buf);
         return;
       }
       buf += decoder.decode(value, { stream: true });
       let idx: number;
       while ((idx = buf.indexOf("\n")) !== -1) {
-        yield buf.slice(0, idx);
+        // Strip trailing \r so CRLF-terminated lines don't break JSON.parse.
+        yield trimCR(buf.slice(0, idx));
         buf = buf.slice(idx + 1);
       }
     }
@@ -476,6 +500,17 @@ const activeProc = proc;
 const procStdout = activeProc.stdout as ReadableStream<Uint8Array>;
 const procStderr = activeProc.stderr as ReadableStream<Uint8Array>;
 
+let shutdownSignalReceived = false;
+
+// If a detached pump fails (emit throws on disk/perm error, reader throws),
+// we'd rather shut down cleanly than leak an unhandled rejection.
+const fatalPumpError = (where: string) => (err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`cc-deck: ${where} failed: ${msg}`);
+  shutdownSignalReceived = true;
+  activeProc.kill();
+};
+
 (async () => {
   for await (const line of readLines(procStdout)) {
     if (!line.trim()) continue;
@@ -490,7 +525,7 @@ const procStderr = activeProc.stderr as ReadableStream<Uint8Array>;
       });
     }
   }
-})();
+})().catch(fatalPumpError("stdout pump"));
 
 // === pipe subprocess stderr → subprocess_stderr envelope events ===
 
@@ -498,11 +533,9 @@ const procStderr = activeProc.stderr as ReadableStream<Uint8Array>;
   for await (const line of readLines(procStderr)) {
     await emit("subprocess_stderr", { line });
   }
-})();
+})().catch(fatalPumpError("stderr pump"));
 
 // === subprocess exit → emit + shutdown ===
-
-let shutdownSignalReceived = false;
 
 (async () => {
   const code = await activeProc.exited;
@@ -517,7 +550,12 @@ let shutdownSignalReceived = false;
   await jsonlWriter.end();
   server.stop();
   process.exit(shutdownSignalReceived ? 0 : code === 0 ? 0 : 1);
-})();
+})().catch((err) => {
+  // Shutdown sequence itself failed. Nothing graceful left to do.
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`cc-deck: shutdown handler failed: ${msg}`);
+  process.exit(1);
+});
 
 // === signal handlers: clean shutdown on Ctrl-C / systemctl stop ===
 

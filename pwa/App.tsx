@@ -141,7 +141,11 @@ type ContentBlock =
   | {
       type: "tool_result";
       tool_use_id: string;
-      content: string;
+      // Anthropic's tool_result block technically allows structured content
+      // (text blocks, image blocks) in addition to plain strings. CC's CLI
+      // emits strings today but typing this as `unknown` lets the renderer
+      // handle both without a future schema drift breaking the UI.
+      content: unknown;
       is_error?: boolean;
     };
 
