@@ -334,3 +334,30 @@ body {
   color: #666;
   cursor: not-allowed;
 }
+
+/* === desktop: wider container, denser cards === */
+@media (min-width: 1024px) {
+  .app {
+    max-width: 1200px;
+  }
+
+  .card {
+    padding: 0.4rem 0.7rem;
+    font-size: 0.8rem;
+  }
+  .card-body {
+    font-size: 0.78rem;
+    max-height: 60vh;
+  }
+  .card-preview {
+    font-size: 0.75rem;
+  }
+
+  .bubble {
+    max-width: 65%;
+  }
+
+  .notice {
+    font-size: 0.78rem;
+  }
+}
