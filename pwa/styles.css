@@ -106,7 +106,6 @@ body {
   padding: 0.6rem 0.85rem;
   border-radius: 14px;
   line-height: 1.4;
-  word-wrap: break-word;
   overflow-wrap: anywhere;
 }
 .bubble-user {

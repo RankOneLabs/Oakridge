@@ -218,7 +218,9 @@ function ToolUseCard({
 }: {
   block: Extract<ContentBlock, { type: "tool_use" }>;
 }) {
-  const preview = JSON.stringify(block.input);
+  // JSON.stringify(undefined) returns undefined, not the string "undefined";
+  // coalesce to null so preview is always a string even for malformed inputs.
+  const preview = JSON.stringify(block.input ?? null) ?? "null";
   const short = preview.length > 80 ? preview.slice(0, 80) + "…" : preview;
   return (
     <details className="card card-tool-use">
@@ -422,6 +424,7 @@ function InputBox() {
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder="message CC…"
+          aria-label="message input"
           rows={1}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {

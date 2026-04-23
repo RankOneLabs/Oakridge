@@ -128,7 +128,17 @@ app.get("/stream", (c) => {
       const contents = await readFile(jsonlPath, "utf8");
       for (const line of contents.split("\n")) {
         if (!line.trim()) continue;
-        const evt = JSON.parse(line) as EnvelopeEvent;
+        let evt: EnvelopeEvent;
+        try {
+          evt = JSON.parse(line) as EnvelopeEvent;
+        } catch {
+          // Partial line from a crash, or a corrupted byte — log and keep going
+          // rather than tearing down the SSE setup.
+          console.error(
+            `cc-deck: skipping malformed JSONL line: ${line.slice(0, 120)}`,
+          );
+          continue;
+        }
         if (evt.id <= sentUpTo) continue; // already on the client via Last-Event-ID
         sentUpTo = evt.id;
         await stream.writeSSE({
@@ -173,7 +183,15 @@ app.get("/events", async (c) => {
   const events: EnvelopeEvent[] = [];
   for (const line of contents.split("\n")) {
     if (!line.trim()) continue;
-    const evt = JSON.parse(line) as EnvelopeEvent;
+    let evt: EnvelopeEvent;
+    try {
+      evt = JSON.parse(line) as EnvelopeEvent;
+    } catch {
+      console.error(
+        `cc-deck: skipping malformed JSONL line: ${line.slice(0, 120)}`,
+      );
+      continue;
+    }
     if (evt.id > since) events.push(evt);
   }
   return c.json({ session_id: sessionId, events });
@@ -253,23 +271,36 @@ app.post("/hook/approval", async (c) => {
 
   const requestId = randomUUID();
   const signal = c.req.raw.signal;
+
+  // Install the waiter and abort listener before any await, so /approval can't
+  // arrive before the map entry exists.
+  let resolveDecision: (d: Decision) => void;
+  let rejectDecision: (e: Error) => void;
+  const decisionPromise = new Promise<Decision>((res, rej) => {
+    resolveDecision = res;
+    rejectDecision = rej;
+  });
+  pendingApprovals.set(requestId, { resolve: resolveDecision! });
+  // If the gate's curl is aborted (CC killed, --max-time expired, server
+  // shutting down), reject so we don't leak the map entry forever.
+  signal.addEventListener(
+    "abort",
+    () => rejectDecision!(new Error("gate_aborted")),
+    { once: true },
+  );
+
   try {
-    const decision = await new Promise<Decision>((resolveDecision, rejectDecision) => {
-      pendingApprovals.set(requestId, { resolve: resolveDecision });
-      // If the gate's curl is aborted (CC killed, --max-time expired, server
-      // shutting down), reject so we don't leak the map entry forever.
-      signal.addEventListener(
-        "abort",
-        () => rejectDecision(new Error("gate_aborted")),
-        { once: true },
-      );
-      void emit("permission_request", {
-        request_id: requestId,
-        tool_name: hook.tool_name,
-        tool_input: hook.tool_input,
-        tool_use_id: hook.tool_use_id,
-      });
+    // Await instead of fire-and-forget so a failing emit (disk full,
+    // permission error) surfaces through the outer catch rather than
+    // becoming an unhandled rejection.
+    await emit("permission_request", {
+      request_id: requestId,
+      tool_name: hook.tool_name,
+      tool_input: hook.tool_input,
+      tool_use_id: hook.tool_use_id,
     });
+
+    const decision = await decisionPromise;
 
     await emit("permission_resolved", { request_id: requestId, decision });
 
