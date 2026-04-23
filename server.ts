@@ -1,9 +1,10 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { parseArgs } from "node:util";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // === args ===
 
@@ -182,16 +183,95 @@ app.post("/input", async (c) => {
   return c.json({ ok: true });
 });
 
-app.post("/approval", (c) => c.text("not implemented", 501));
-app.post("/hook/approval", (c) => c.text("not implemented", 501));
+// === approval plumbing ===
 
-let server: ReturnType<typeof Bun.serve>;
+type Decision = "allow" | "deny";
+interface PendingApproval {
+  resolve: (d: Decision) => void;
+}
+const pendingApprovals = new Map<string, PendingApproval>();
+
+interface HookInput {
+  session_id: string;
+  tool_name: string;
+  tool_input: unknown;
+  tool_use_id: string;
+  hook_event_name: string;
+}
+
+app.post("/hook/approval", async (c) => {
+  // only accept from 127.0.0.1 — the gate runs in our process tree
+  if (!bunServer) return c.text("server not ready", 503);
+  const info = bunServer.requestIP(c.req.raw);
+  if (!info || (info.address !== "127.0.0.1" && info.address !== "::1")) {
+    return c.text("forbidden", 403);
+  }
+
+  let hook: HookInput;
+  try {
+    hook = (await c.req.json()) as HookInput;
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (hook.hook_event_name !== "PreToolUse") {
+    return c.json({ error: `unexpected hook_event_name: ${hook.hook_event_name}` }, 400);
+  }
+
+  const requestId = randomUUID();
+  const decision = await new Promise<Decision>((resolveDecision) => {
+    pendingApprovals.set(requestId, { resolve: resolveDecision });
+    void emit("permission_request", {
+      request_id: requestId,
+      tool_name: hook.tool_name,
+      tool_input: hook.tool_input,
+      tool_use_id: hook.tool_use_id,
+    });
+  });
+
+  await emit("permission_resolved", { request_id: requestId, decision });
+
+  return c.json({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: decision,
+      permissionDecisionReason:
+        decision === "allow"
+          ? "operator approved via cc-deck"
+          : "operator denied via cc-deck",
+    },
+  });
+});
+
+app.post("/approval", async (c) => {
+  let body: { request_id?: unknown; decision?: unknown };
+  try {
+    body = (await c.req.json()) as { request_id?: unknown; decision?: unknown };
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (typeof body.request_id !== "string") {
+    return c.json({ error: "request_id must be a string" }, 400);
+  }
+  if (body.decision !== "approve" && body.decision !== "deny") {
+    return c.json({ error: "decision must be 'approve' or 'deny'" }, 400);
+  }
+  const pending = pendingApprovals.get(body.request_id);
+  if (!pending) {
+    return c.json({ error: "unknown or already-resolved request_id" }, 404);
+  }
+  pendingApprovals.delete(body.request_id);
+  pending.resolve(body.decision === "approve" ? "allow" : "deny");
+  return c.json({ ok: true });
+});
+
+let bunServer: ReturnType<typeof Bun.serve> | null = null;
 try {
-  server = Bun.serve({
+  bunServer = Bun.serve({
     port,
     hostname: "0.0.0.0",
     // SSE streams are long-lived; Bun defaults to 10s per request which
-    // drops the connection before our 15s heartbeat fires.
+    // drops the connection before our 15s heartbeat fires. Hook approval
+    // requests also park for as long as the operator takes to tap.
     idleTimeout: 255,
     fetch: app.fetch,
   });
@@ -201,12 +281,35 @@ try {
   console.error(`is another cc-deck running? try: lsof -i :${port}`);
   process.exit(1);
 }
+const server = bunServer;
 
 console.error(
   `cc-deck listening on http://${server.hostname}:${server.port}, workdir=${workdir}, session=${sessionId}`,
 );
 
 // === spawn CC subprocess ===
+
+// generate a settings.json that registers gate.sh as the PreToolUse hook
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const gatePath = resolve(scriptDir, "scripts", "gate.sh");
+const settingsPath = join(dataDir, "settings.json");
+await writeFile(
+  settingsPath,
+  JSON.stringify(
+    {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: ".*",
+            hooks: [{ type: "command", command: gatePath }],
+          },
+        ],
+      },
+    },
+    null,
+    2,
+  ),
+);
 
 const cmd = [
   claudeBin,
@@ -216,6 +319,8 @@ const cmd = [
   "--include-hook-events",
   "--replay-user-messages",
   "--verbose",
+  "--setting-sources", "",
+  "--settings", settingsPath,
 ];
 
 await emit("session_started", { command: cmd, workdir, sessionId });
@@ -228,6 +333,10 @@ try {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
+    env: {
+      ...process.env,
+      CC_DECK_PORT: String(port),
+    },
   });
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
