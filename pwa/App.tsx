@@ -382,18 +382,33 @@ function UnknownRow({ event }: { event: EnvelopeEvent }) {
 function InputBox() {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function send() {
     const payload = text.trim();
     if (!payload || sending) return;
     setSending(true);
+    setError(null);
     try {
       const res = await fetch("/input", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: payload }),
       });
-      if (res.ok) setText("");
+      if (res.ok) {
+        setText("");
+      } else {
+        const body = (await res.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        setError(
+          typeof body?.error === "string"
+            ? body.error
+            : `server returned ${res.status}`,
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "network error");
     } finally {
       setSending(false);
     }
@@ -401,25 +416,28 @@ function InputBox() {
 
   return (
     <div className="input-bar">
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder="message CC…"
-        rows={1}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            void send();
-          }
-        }}
-      />
-      <button
-        type="button"
-        onClick={() => void send()}
-        disabled={sending || text.trim().length === 0}
-      >
-        Send
-      </button>
+      {error && <div className="input-error">error: {error}</div>}
+      <div className="input-bar-row">
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="message CC…"
+          rows={1}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void send();
+            }
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => void send()}
+          disabled={sending || text.trim().length === 0}
+        >
+          Send
+        </button>
+      </div>
     </div>
   );
 }

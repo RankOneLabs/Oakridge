@@ -14,7 +14,7 @@ const { values } = parseArgs({
     workdir: { type: "string" },
     port: { type: "string", default: "8788" },
     claudeBin: { type: "string", default: "claude" },
-    dataDir: { type: "string", default: "./data" },
+    dataDir: { type: "string" },
   },
 });
 
@@ -30,7 +30,13 @@ if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   process.exit(1);
 }
 const claudeBin = values.claudeBin ?? "claude";
-const dataDir = values.dataDir ?? "./data";
+
+// Resolve defaults from the server.ts location so data/ and pwa/dist/ don't
+// depend on where the operator ran the command from. Operator override via
+// --dataDir still works.
+const moduleDir = dirname(fileURLToPath(import.meta.url));
+const dataDir = values.dataDir ?? join(moduleDir, "data");
+const pwaDistDir = join(moduleDir, "pwa", "dist");
 
 // === session init ===
 
@@ -83,6 +89,11 @@ const app = new Hono();
 
 app.get("/stream", (c) => {
   const signal = c.req.raw.signal;
+  // EventSource replays Last-Event-ID on automatic reconnect. Resume from
+  // there instead of re-sending the entire transcript each time.
+  const lastEventIdHeader = c.req.header("last-event-id");
+  const parsedResumeId = lastEventIdHeader ? Number(lastEventIdHeader) : NaN;
+  const resumeAfter = Number.isFinite(parsedResumeId) ? parsedResumeId : -1;
   return streamSSE(c, async (stream) => {
     const pending: EnvelopeEvent[] = [];
     let notify: (() => void) | null = null;
@@ -111,14 +122,15 @@ app.get("/stream", (c) => {
       stream.write(": ping\n\n").catch(() => {});
     }, 15000);
 
-    let sentUpTo = -1;
+    let sentUpTo = resumeAfter;
     try {
-      // catchup: replay everything already in the JSONL
+      // catchup: replay events from the JSONL that the client hasn't seen.
       const contents = await readFile(jsonlPath, "utf8");
       for (const line of contents.split("\n")) {
         if (!line.trim()) continue;
         const evt = JSON.parse(line) as EnvelopeEvent;
-        sentUpTo = Math.max(sentUpTo, evt.id);
+        if (evt.id <= sentUpTo) continue; // already on the client via Last-Event-ID
+        sentUpTo = evt.id;
         await stream.writeSSE({
           event: "message",
           data: JSON.stringify(evt),
@@ -194,8 +206,14 @@ app.post("/input", async (c) => {
     stdin.write(line);
     await stdin.flush();
   };
-  inputQueue = inputQueue.then(task, task);
-  await inputQueue;
+  try {
+    inputQueue = inputQueue.then(task, task);
+    await inputQueue;
+  } catch (err) {
+    // Subprocess exited between our ready-check and the write (EPIPE etc.).
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `subprocess write failed: ${msg}` }, 503);
+  }
   return c.json({ ok: true });
 });
 
@@ -306,7 +324,7 @@ app.post("/approval", async (c) => {
 app.use(
   "/*",
   serveStatic({
-    root: "./pwa/dist",
+    root: pwaDistDir,
     rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
   }),
 );
@@ -337,8 +355,7 @@ console.error(
 // === spawn CC subprocess ===
 
 // generate a settings.json that registers gate.sh as the PreToolUse hook
-const scriptDir = dirname(fileURLToPath(import.meta.url));
-const gatePath = resolve(scriptDir, "scripts", "gate.sh");
+const gatePath = resolve(moduleDir, "scripts", "gate.sh");
 const settingsPath = join(dataDir, "settings.json");
 await writeFile(
   settingsPath,
