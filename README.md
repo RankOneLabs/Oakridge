@@ -27,7 +27,13 @@ bun run dev:pwa
 # open http://localhost:5173
 ```
 
-## Deployment (cgroup-limited)
+## Running
+
+The primary flow is just `bun run scripts/cc-start <workdir>` in a terminal. Ctrl-C to stop; CC dies with the server.
+
+### Optional: cgroup limits via systemd-run
+
+If you want to bound resource use (shared box, or a box hosting other workloads), wrap the invocation:
 
 ```bash
 systemd-run --user --scope --unit=cc-deck \
@@ -35,7 +41,7 @@ systemd-run --user --scope --unit=cc-deck \
   bun run server.ts --workdir=/path/to/your/repo
 ```
 
-Stop with `systemctl --user stop cc-deck`.
+Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation.
 
 ## Layout
 
