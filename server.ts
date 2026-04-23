@@ -13,6 +13,11 @@ const { values } = parseArgs({
   options: {
     workdir: { type: "string" },
     port: { type: "string", default: "8788" },
+    // Default to loopback so a laptop connected to mixed networks (home wifi,
+    // coffee shop, etc.) doesn't silently expose unauthenticated /input,
+    // /approval, /stream, /events to any reachable peer. Operator opts into
+    // phone/tablet access over Tailscale with --host=0.0.0.0.
+    host: { type: "string", default: "127.0.0.1" },
     claudeBin: { type: "string", default: "claude" },
     dataDir: { type: "string" },
   },
@@ -29,6 +34,7 @@ if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   console.error(`invalid --port=${values.port}`);
   process.exit(1);
 }
+const host = values.host ?? "127.0.0.1";
 const claudeBin = values.claudeBin ?? "claude";
 
 // Resolve defaults from the server.ts location so data/ and pwa/dist/ don't
@@ -225,15 +231,18 @@ app.post("/input", async (c) => {
   } catch {
     return c.json({ error: "invalid json" }, 400);
   }
-  if (typeof body.text !== "string" || body.text.length === 0) {
-    return c.json({ error: "text must be a non-empty string" }, 400);
+  if (typeof body.text !== "string") {
+    return c.json({ error: "text must be a string" }, 400);
+  }
+  const text = body.text.trim();
+  if (text.length === 0) {
+    return c.json({ error: "text must be non-empty" }, 400);
   }
   if (!proc) {
     // Window at startup: HTTP server binds before Bun.spawn runs.
     return c.json({ error: "subprocess not ready" }, 503);
   }
   const stdin = proc.stdin as import("bun").FileSink;
-  const text = body.text;
   const task = async () => {
     const line =
       JSON.stringify({
@@ -333,17 +342,30 @@ app.post("/hook/approval", async (c) => {
             : "operator denied via cc-deck",
       },
     });
-  } catch {
-    // Gate aborted before a decision arrived. Clean up the map entry and
-    // notify connected UI clients so the card clears.
-    if (pendingApprovals.delete(requestId)) {
+  } catch (err) {
+    const isGateAbort =
+      err instanceof Error && err.message === "gate_aborted";
+    pendingApprovals.delete(requestId);
+    if (isGateAbort) {
+      // Operator-visible: the gate request was cancelled before a decision.
+      // Best-effort notify connected UI clients so the card clears.
       await emit("permission_resolved", {
         request_id: requestId,
         decision: "deny",
         reason: "gate_aborted",
+      }).catch((e) => {
+        console.error(
+          `cc-deck: failed to emit gate-aborted resolution: ${e instanceof Error ? e.message : String(e)}`,
+        );
       });
+      return c.json({ error: "gate aborted" }, 408);
     }
-    return c.json({ error: "gate aborted" }, 408);
+    // Unexpected failure (e.g. emit() threw on disk/perm error). Log and
+    // report distinctly from an abort so the caller can tell them apart.
+    console.error(
+      `cc-deck: /hook/approval failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return c.json({ error: "internal error" }, 500);
   }
 });
 
@@ -383,7 +405,7 @@ let bunServer: ReturnType<typeof Bun.serve> | null = null;
 try {
   bunServer = Bun.serve({
     port,
-    hostname: "0.0.0.0",
+    hostname: host,
     // SSE streams are long-lived; Bun defaults to 10s per request which
     // drops the connection before our 15s heartbeat fires. Hook approval
     // requests also park for as long as the operator takes to tap.

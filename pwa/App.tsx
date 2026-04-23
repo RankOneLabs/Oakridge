@@ -245,7 +245,10 @@ function ToolResultCard({
   block: Extract<ContentBlock, { type: "tool_result" }>;
   eventId: number;
 }) {
-  const content = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+  const content =
+    typeof block.content === "string"
+      ? block.content
+      : (JSON.stringify(block.content ?? null) ?? "null");
   const preview = content.length > 80 ? content.slice(0, 80) + "…" : content;
   return (
     <details

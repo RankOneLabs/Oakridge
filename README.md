@@ -14,7 +14,15 @@ bun run build:pwa
 bun run scripts/cc-start /path/to/your/repo
 ```
 
-Then open `http://<host>:8788/` on your phone. Add to Home Screen for a full-screen standalone app.
+Defaults to `127.0.0.1:8788` — open `http://localhost:8788/` in a browser on the same machine.
+
+For phone/tablet access over Tailscale, bind all interfaces:
+
+```bash
+bun run scripts/cc-start /path/to/your/repo --host=0.0.0.0
+```
+
+Then open `http://<machine>:8788/` on your phone. Add to Home Screen for a full-screen standalone app. Only do this on networks where every reachable peer is trusted (Tailscale-only, or a LAN you control) — the control endpoints (`/input`, `/approval`, `/stream`, `/events`) are unauthenticated in v0.
 
 ## Development
 
@@ -53,7 +61,7 @@ Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation
 
 ## Security posture
 
-- **Network auth:** Tailscale. No user accounts. If it's on the tailnet it's trusted.
+- **Network:** binds to `127.0.0.1` by default. Operator opts into wider exposure with `--host=0.0.0.0` for tailnet/phone access, and is responsible for ensuring only trusted peers can reach the port (Tailscale-only, LAN firewall, etc.). Control endpoints (`/input`, `/approval`, `/stream`, `/events`) are unauthenticated in v0 — token-based auth is planned follow-up work.
 - **Hook endpoint:** `/hook/approval` is filtered to `127.0.0.1` at the route handler — only the in-process gate script can park approval requests, not a tailnet peer.
 - **Markdown:** assistant text is rendered with `react-markdown` + `rehype-sanitize`; no `dangerouslySetInnerHTML`, so prompt-injected HTML from web-fetched content can't execute.
 - **CC user settings:** the server spawns CC with `--setting-sources ''` so user-level allowlists don't bypass the approval gate.
