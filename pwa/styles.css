@@ -158,6 +158,129 @@ body {
   margin-right: 0.4rem;
 }
 
+.card {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  width: 100%;
+}
+
+.card summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  color: #ccc;
+}
+.card summary::-webkit-details-marker {
+  display: none;
+}
+.card summary::before {
+  content: "▸";
+  color: #666;
+}
+.card[open] summary::before {
+  content: "▾";
+}
+
+.card-label {
+  color: #888;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+}
+.card-name {
+  color: #a0c0ff;
+  font-weight: 500;
+}
+.card-preview {
+  color: #777;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.card-body {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem;
+  background: #0d1117;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+  font-size: 0.8rem;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.card-footer {
+  margin-top: 0.4rem;
+  color: #555;
+  font-size: 0.7rem;
+}
+.card-error {
+  margin-top: 0.4rem;
+  color: #e67070;
+}
+
+.card-tool-result.is-error {
+  border-color: #633;
+  background: #1d0f0f;
+}
+
+.card-permission {
+  border-color: #4a3f1a;
+  background: #26200f;
+  box-shadow: 0 0 12px rgba(230, 198, 112, 0.15);
+}
+.card-permission-header {
+  color: #e6c670;
+  font-weight: 600;
+  font-size: 1rem;
+  font-family: -apple-system, system-ui, sans-serif;
+  margin-bottom: 0.5rem;
+}
+.card-permission-buttons {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+.card-permission-buttons button {
+  flex: 1;
+  min-height: 44px;
+  padding: 0.75rem;
+  border: none;
+  border-radius: 8px;
+  font: inherit;
+  font-family: -apple-system, system-ui, sans-serif;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.btn-deny {
+  background: #3a2020;
+  color: #e67070;
+}
+.btn-approve {
+  background: #2563eb;
+  color: white;
+}
+.card-permission-buttons button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.notice-allow {
+  color: #7dd890;
+}
+.notice-deny {
+  color: #e67070;
+}
+
 .input-bar {
   position: fixed;
   left: 0;

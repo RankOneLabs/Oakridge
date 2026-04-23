@@ -1,4 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Markdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 
@@ -10,6 +16,7 @@ export interface EnvelopeEvent {
 }
 
 type Status = "connecting" | "connected" | "disconnected";
+type ResolutionMap = Map<string, "allow" | "deny">;
 
 export function App() {
   const [events, setEvents] = useState<EnvelopeEvent[]>([]);
@@ -33,16 +40,36 @@ export function App() {
     return () => es.close();
   }, []);
 
+  const resolutions: ResolutionMap = useMemo(() => {
+    const map: ResolutionMap = new Map();
+    for (const e of events) {
+      if (e.type === "permission_resolved") {
+        const p = e.payload as {
+          request_id?: string;
+          decision?: "allow" | "deny";
+        };
+        if (p.request_id && p.decision) map.set(p.request_id, p.decision);
+      }
+    }
+    return map;
+  }, [events]);
+
   return (
     <div className="app">
       <TopBar status={status} eventCount={events.length} />
-      <EventList events={events} />
+      <EventList events={events} resolutions={resolutions} />
       <InputBox />
     </div>
   );
 }
 
-function TopBar({ status, eventCount }: { status: Status; eventCount: number }) {
+function TopBar({
+  status,
+  eventCount,
+}: {
+  status: Status;
+  eventCount: number;
+}) {
   return (
     <header className="top-bar">
       <span className={`status status-${status}`}>{status}</span>
@@ -51,7 +78,13 @@ function TopBar({ status, eventCount }: { status: Status; eventCount: number }) 
   );
 }
 
-function EventList({ events }: { events: EnvelopeEvent[] }) {
+function EventList({
+  events,
+  resolutions,
+}: {
+  events: EnvelopeEvent[];
+  resolutions: ResolutionMap;
+}) {
   const endRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
@@ -59,25 +92,35 @@ function EventList({ events }: { events: EnvelopeEvent[] }) {
   return (
     <div className="events">
       {events.map((e) => (
-        <EventRow key={e.id} event={e} />
+        <EventRow key={e.id} event={e} resolutions={resolutions} />
       ))}
       <div ref={endRef} />
     </div>
   );
 }
 
-function EventRow({ event }: { event: EnvelopeEvent }) {
+function EventRow({
+  event,
+  resolutions,
+}: {
+  event: EnvelopeEvent;
+  resolutions: ResolutionMap;
+}) {
   switch (event.type) {
     case "user":
       return <UserRow event={event} />;
     case "assistant":
       return <AssistantRow event={event} />;
+    case "permission_request":
+      return <PermissionRow event={event} resolutions={resolutions} />;
+    case "permission_resolved":
+      // folded into the matching permission_request card
+      return null;
     case "system":
     case "session_started":
     case "subprocess_exited":
     case "subprocess_stderr":
     case "rate_limit_event":
-    case "permission_resolved":
       return <SystemNotice event={event} />;
     default:
       return <UnknownRow event={event} />;
@@ -105,7 +148,6 @@ function UserRow({ event }: { event: EnvelopeEvent }) {
   const p = event.payload as CCUserPayload;
   const content = p.message?.content;
 
-  // User-typed text (arrives as a string; flagged isReplay via --replay-user-messages).
   if (typeof content === "string") {
     return (
       <div className="row row-user">
@@ -114,16 +156,22 @@ function UserRow({ event }: { event: EnvelopeEvent }) {
     );
   }
 
-  // Content is an array of blocks (tool_result comes through here).
-  // Tool_result is rendered in a follow-up commit; for now surface as a muted notice.
   if (Array.isArray(content)) {
     return (
-      <div className="row row-system">
-        <div className="notice notice-muted">
-          <span className="notice-tag">#{event.id}</span>{" "}
-          {content.map((b) => b.type).join(", ")}
-        </div>
-      </div>
+      <>
+        {content.map((block, idx) => {
+          if (block.type === "tool_result") {
+            return (
+              <ToolResultCard
+                key={`${event.id}-${idx}`}
+                block={block}
+                eventId={event.id}
+              />
+            );
+          }
+          return <UnknownRow key={`${event.id}-${idx}`} event={event} />;
+        })}
+      </>
     );
   }
   return <UnknownRow event={event} />;
@@ -156,18 +204,133 @@ function AssistantRow({ event }: { event: EnvelopeEvent }) {
           );
         }
         if (block.type === "tool_use") {
-          // Rendered properly in the next commit; stub for now.
-          return (
-            <div key={key} className="row row-system">
-              <div className="notice notice-muted">
-                tool_use {block.name}
-              </div>
-            </div>
-          );
+          return <ToolUseCard key={key} block={block} />;
         }
         return <UnknownRow key={key} event={event} />;
       })}
     </>
+  );
+}
+
+function ToolUseCard({
+  block,
+}: {
+  block: Extract<ContentBlock, { type: "tool_use" }>;
+}) {
+  const preview = JSON.stringify(block.input);
+  const short = preview.length > 80 ? preview.slice(0, 80) + "…" : preview;
+  return (
+    <details className="card card-tool-use">
+      <summary>
+        <span className="card-label">tool_use</span>
+        <span className="card-name">{block.name}</span>
+        <span className="card-preview">{short}</span>
+      </summary>
+      <pre className="card-body">{JSON.stringify(block.input, null, 2)}</pre>
+    </details>
+  );
+}
+
+function ToolResultCard({
+  block,
+  eventId,
+}: {
+  block: Extract<ContentBlock, { type: "tool_result" }>;
+  eventId: number;
+}) {
+  const content = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+  const preview = content.length > 80 ? content.slice(0, 80) + "…" : content;
+  return (
+    <details
+      className={`card card-tool-result ${block.is_error ? "is-error" : ""}`}
+    >
+      <summary>
+        <span className="card-label">
+          tool_result{block.is_error ? " (error)" : ""}
+        </span>
+        <span className="card-preview">{preview || <em>empty</em>}</span>
+      </summary>
+      <pre className="card-body">{content}</pre>
+      <div className="card-footer">id #{eventId} · tool_use_id {block.tool_use_id.slice(0, 12)}…</div>
+    </details>
+  );
+}
+
+interface PermissionRequestPayload {
+  request_id: string;
+  tool_name: string;
+  tool_input: unknown;
+  tool_use_id: string;
+}
+
+function PermissionRow({
+  event,
+  resolutions,
+}: {
+  event: EnvelopeEvent;
+  resolutions: ResolutionMap;
+}) {
+  const p = event.payload as PermissionRequestPayload;
+  const resolution = resolutions.get(p.request_id);
+  const [localPending, setLocalPending] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  if (resolution) {
+    return (
+      <div className="row row-system">
+        <div className={`notice notice-${resolution}`}>
+          {resolution === "allow" ? "approved" : "denied"} · {p.tool_name}
+        </div>
+      </div>
+    );
+  }
+
+  async function decide(decision: "approve" | "deny") {
+    if (localPending) return;
+    setLocalPending(true);
+    setLocalError(null);
+    try {
+      const res = await fetch("/approval", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ request_id: p.request_id, decision }),
+      });
+      if (!res.ok) {
+        setLocalError(`server returned ${res.status}`);
+      }
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "request failed");
+    } finally {
+      setLocalPending(false);
+    }
+  }
+
+  const inputPreview = JSON.stringify(p.tool_input, null, 2);
+
+  return (
+    <div className="card card-permission">
+      <div className="card-permission-header">Approve {p.tool_name}?</div>
+      <pre className="card-body">{inputPreview}</pre>
+      {localError && <div className="card-error">error: {localError}</div>}
+      <div className="card-permission-buttons">
+        <button
+          type="button"
+          className="btn-deny"
+          disabled={localPending}
+          onClick={() => void decide("deny")}
+        >
+          Deny
+        </button>
+        <button
+          type="button"
+          className="btn-approve"
+          disabled={localPending}
+          onClick={() => void decide("approve")}
+        >
+          Approve
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -186,9 +349,6 @@ function SystemNotice({ event }: { event: EnvelopeEvent }) {
       break;
     case "rate_limit_event":
       text = "rate limit event";
-      break;
-    case "permission_resolved":
-      text = `permission ${String(p.decision ?? "?")}`;
       break;
     case "system": {
       const raw = event.payload as { subtype?: string } | null;
