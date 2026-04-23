@@ -20,7 +20,12 @@ export function App() {
   const [resolutions, setResolutions] = useState<ResolutionMap>(
     () => new Map(),
   );
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const seenIds = useRef<Set<number>>(new Set());
+  const endRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [events.length]);
 
   useEffect(() => {
     const es = new EventSource("/stream");
@@ -48,6 +53,14 @@ export function App() {
             });
           }
         }
+        if (evt.type === "session_started") {
+          const p = evt.payload as { sessionId?: unknown };
+          // Latest session_started wins — after a reconnect, the server's
+          // current session id replaces any stale one from catchup.
+          if (typeof p.sessionId === "string") {
+            setSessionId(p.sessionId);
+          }
+        }
       } catch {
         // malformed frame; ignore
       }
@@ -57,9 +70,18 @@ export function App() {
 
   return (
     <div className="app">
-      <TopBar status={status} eventCount={events.length} />
+      <TopBar
+        status={status}
+        eventCount={events.length}
+        sessionId={sessionId}
+      />
       <EventList events={events} resolutions={resolutions} />
       <InputBox />
+      {/* Scroll sentinel lives after InputBox so auto-scroll keeps the input
+          visible on desktop (where the input is inline, not fixed). On mobile
+          the input is position:fixed, so this sits behind the overlay, which
+          is harmless. */}
+      <div ref={endRef} aria-hidden="true" />
     </div>
   );
 }
@@ -67,14 +89,25 @@ export function App() {
 function TopBar({
   status,
   eventCount,
+  sessionId,
 }: {
   status: Status;
   eventCount: number;
+  sessionId: string | null;
 }) {
   return (
     <header className="top-bar">
       <span className={`status status-${status}`}>{status}</span>
       <span className="event-count">{eventCount} events</span>
+      {sessionId && (
+        <span
+          className="session-id"
+          title={`session ${sessionId}`}
+          aria-label={`Session ID ${sessionId}`}
+        >
+          {sessionId.slice(0, 8)}
+        </span>
+      )}
     </header>
   );
 }
@@ -86,16 +119,11 @@ function EventList({
   events: EnvelopeEvent[];
   resolutions: ResolutionMap;
 }) {
-  const endRef = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [events.length]);
   return (
     <div className="events">
       {events.map((e) => (
         <EventRow key={e.id} event={e} resolutions={resolutions} />
       ))}
-      <div ref={endRef} />
     </div>
   );
 }
@@ -448,6 +476,7 @@ function InputBox() {
           Send
         </button>
       </div>
+      <div className="input-hint">Enter to send · Shift+Enter for newline</div>
     </div>
   );
 }

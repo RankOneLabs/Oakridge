@@ -64,6 +64,32 @@ body {
   color: #888;
 }
 
+.session-id {
+  /* Shown only at desktop widths — below that, screen real estate is at a
+     premium and the id isn't operator-actionable info. */
+  display: none;
+  color: #999;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.input-hint {
+  /* Desktop-only keyboard hint next to the inline input. Hidden by default. */
+  display: none;
+  color: #999;
+  font-size: 0.75rem;
+  padding: 0 0.25rem;
+}
+
+/* Consistent keyboard focus indicator across interactive elements. */
+.input-bar button:focus-visible,
+.card-permission-buttons button:focus-visible,
+.card summary:focus-visible,
+.row-thinking summary:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
 .events {
   display: flex;
   flex-direction: column;
@@ -333,4 +359,54 @@ body {
   background: #333;
   color: #666;
   cursor: not-allowed;
+}
+
+/* === desktop: wider container, denser cards, inline input === */
+@media (min-width: 1024px) {
+  .app {
+    max-width: 1200px;
+    /* No fixed-bottom input to reserve space for at desktop widths. */
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .card {
+    padding: 0.4rem 0.7rem;
+    font-size: 0.8rem;
+  }
+  .card-body {
+    font-size: 0.78rem;
+    max-height: 60vh;
+  }
+  .card-preview {
+    font-size: 0.75rem;
+  }
+
+  .bubble {
+    max-width: 65%;
+  }
+
+  .notice {
+    font-size: 0.78rem;
+  }
+
+  .input-bar {
+    position: static;
+    margin: 0.75rem 0 1rem;
+    padding: 0.75rem;
+    border: 1px solid #2a2a2a;
+    border-radius: 10px;
+    background: #151515;
+  }
+  .input-bar textarea {
+    /* Desktop has room for a multi-line default — less cramped than the
+       mobile rows={1} single-line start. */
+    min-height: 5rem;
+    max-height: 16rem;
+  }
+  .input-hint {
+    display: block;
+  }
+  .session-id {
+    display: inline;
+  }
 }
