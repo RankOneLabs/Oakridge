@@ -30,11 +30,19 @@ app.post("/input", (c) => c.text("not implemented", 501));
 app.post("/approval", (c) => c.text("not implemented", 501));
 app.post("/hook/approval", (c) => c.text("not implemented", 501));
 
-const server = Bun.serve({
-  port,
-  hostname: "0.0.0.0",
-  fetch: app.fetch,
-});
+let server: ReturnType<typeof Bun.serve>;
+try {
+  server = Bun.serve({
+    port,
+    hostname: "0.0.0.0",
+    fetch: app.fetch,
+  });
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`cc-deck: failed to bind port ${port}: ${msg}`);
+  console.error(`is another cc-deck running? try: lsof -i :${port}`);
+  process.exit(1);
+}
 
 console.error(
   `cc-deck listening on http://${server.hostname}:${server.port}, workdir=${workdir}`,

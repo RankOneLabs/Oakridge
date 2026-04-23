@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: cc-start <workdir> [--port=<port>]" >&2
+  exit 1
+fi
+
+WORKDIR="$1"
+shift
+
+if [ ! -d "$WORKDIR" ]; then
+  echo "cc-start: workdir not found: $WORKDIR" >&2
+  exit 1
+fi
+
+WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+exec bun run "$REPO_ROOT/server.ts" --workdir="$WORKDIR_ABS" "$@"
