@@ -1,6 +1,6 @@
 # cc-deck
 
-Mobile command center for Claude Code. Drives a CC session running on a homelab host from a phone over Tailscale. See `comms/cc-deck-v0-spec.md` in the parent repo for the full v0 spec.
+Command center for Claude Code. Drives a CC session from a browser — at your desk, on your phone over Tailscale, or any viewport in between. See `comms/cc-deck-v0-spec.md` in the parent repo for the full v0 spec.
 
 ## How it works
 
@@ -56,7 +56,7 @@ Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation
 - `server.ts` — Hono + Bun process supervisor (CC subprocess, SSE broadcast, JSONL persistence, hook approval parking)
 - `scripts/cc-start` — launcher that validates the workdir and execs `bun run server.ts`
 - `scripts/gate.sh` — PreToolUse hook; reads hook input on stdin, POSTs to `/hook/approval`, blocks on the operator's decision, echoes the `hookSpecificOutput` reply to CC
-- `pwa/` — React + Vite mobile client, built to `pwa/dist/` and served statically by Hono
+- `pwa/` — React + Vite client (responsive across phone / tablet / desktop), built to `pwa/dist/` and served statically by Hono
 - `data/sessions/` — one JSONL transcript per session (gitignored)
 
 ## Security posture
@@ -66,16 +66,3 @@ Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation
 - **Markdown:** assistant text is rendered with `react-markdown` + `rehype-sanitize`; no `dangerouslySetInnerHTML`, so prompt-injected HTML from web-fetched content can't execute.
 - **CC user settings:** the server spawns CC with `--setting-sources ''` so user-level allowlists don't bypass the approval gate.
 
-## PR walkthrough
-
-The work is structured as 9 commits that build up in layers. Read them in order:
-
-1. `Scaffold Bun + Hono server skeleton` — package.json, tsconfig, .gitignore, stub routes
-2. `Add cc-start launcher and port-conflict error handling`
-3. `Add CC subprocess supervisor and JSONL persistence`
-4. `Wire SSE /stream, /events replay, and /input forwarding`
-5. `Wire PreToolUse hook as the approval gate` ← load-bearing piece
-6. `Scaffold React + Vite PWA and serve static build from Hono`
-7. `Render chat events and add input box`
-8. `Render tool cards and wire permission approval UX`
-9. This commit — manifest, iOS polish, README
