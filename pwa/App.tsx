@@ -1,10 +1,4 @@
-import {
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 
@@ -21,6 +15,11 @@ type ResolutionMap = Map<string, "allow" | "deny">;
 export function App() {
   const [events, setEvents] = useState<EnvelopeEvent[]>([]);
   const [status, setStatus] = useState<Status>("connecting");
+  // Maintain the resolutions map incrementally (O(1) per event) rather than
+  // recomputing across the whole events array on every render.
+  const [resolutions, setResolutions] = useState<ResolutionMap>(
+    () => new Map(),
+  );
   const seenIds = useRef<Set<number>>(new Set());
 
   useEffect(() => {
@@ -33,26 +32,28 @@ export function App() {
         if (seenIds.current.has(evt.id)) return;
         seenIds.current.add(evt.id);
         setEvents((prev) => [...prev, evt]);
+        if (evt.type === "permission_resolved") {
+          const p = evt.payload as {
+            request_id?: string;
+            decision?: "allow" | "deny";
+          };
+          if (p.request_id && p.decision) {
+            const requestId = p.request_id;
+            const decision = p.decision;
+            setResolutions((prev) => {
+              if (prev.get(requestId) === decision) return prev;
+              const next = new Map(prev);
+              next.set(requestId, decision);
+              return next;
+            });
+          }
+        }
       } catch {
         // malformed frame; ignore
       }
     };
     return () => es.close();
   }, []);
-
-  const resolutions: ResolutionMap = useMemo(() => {
-    const map: ResolutionMap = new Map();
-    for (const e of events) {
-      if (e.type === "permission_resolved") {
-        const p = e.payload as {
-          request_id?: string;
-          decision?: "allow" | "deny";
-        };
-        if (p.request_id && p.decision) map.set(p.request_id, p.decision);
-      }
-    }
-    return map;
-  }, [events]);
 
   return (
     <div className="app">

@@ -82,6 +82,7 @@ async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
 const app = new Hono();
 
 app.get("/stream", (c) => {
+  const signal = c.req.raw.signal;
   return streamSSE(c, async (stream) => {
     const pending: EnvelopeEvent[] = [];
     let notify: (() => void) | null = null;
@@ -93,6 +94,17 @@ app.get("/stream", (c) => {
         n();
       }
     });
+
+    // Wake the wait loop if the client disconnects while idle, so the finally
+    // block runs promptly instead of leaking the heartbeat + subscriber.
+    const onAbort = () => {
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
 
     // 15s heartbeat so mobile carriers don't drop the connection
     const heartbeat = setInterval(() => {
@@ -115,7 +127,7 @@ app.get("/stream", (c) => {
       }
 
       // live: drain new events as they arrive
-      while (!stream.aborted) {
+      while (!signal.aborted) {
         if (pending.length === 0) {
           await new Promise<void>((r) => {
             notify = r;
@@ -133,6 +145,7 @@ app.get("/stream", (c) => {
       }
     } finally {
       clearInterval(heartbeat);
+      signal.removeEventListener("abort", onAbort);
       unsub();
     }
   });
@@ -166,6 +179,11 @@ app.post("/input", async (c) => {
   if (typeof body.text !== "string" || body.text.length === 0) {
     return c.json({ error: "text must be a non-empty string" }, 400);
   }
+  if (!proc) {
+    // Window at startup: HTTP server binds before Bun.spawn runs.
+    return c.json({ error: "subprocess not ready" }, 503);
+  }
+  const stdin = proc.stdin as import("bun").FileSink;
   const text = body.text;
   const task = async () => {
     const line =
@@ -173,9 +191,8 @@ app.post("/input", async (c) => {
         type: "user",
         message: { role: "user", content: text },
       }) + "\n";
-    const w = proc.stdin as import("bun").FileSink;
-    w.write(line);
-    await w.flush();
+    stdin.write(line);
+    await stdin.flush();
   };
   inputQueue = inputQueue.then(task, task);
   await inputQueue;
@@ -217,28 +234,49 @@ app.post("/hook/approval", async (c) => {
   }
 
   const requestId = randomUUID();
-  const decision = await new Promise<Decision>((resolveDecision) => {
-    pendingApprovals.set(requestId, { resolve: resolveDecision });
-    void emit("permission_request", {
-      request_id: requestId,
-      tool_name: hook.tool_name,
-      tool_input: hook.tool_input,
-      tool_use_id: hook.tool_use_id,
+  const signal = c.req.raw.signal;
+  try {
+    const decision = await new Promise<Decision>((resolveDecision, rejectDecision) => {
+      pendingApprovals.set(requestId, { resolve: resolveDecision });
+      // If the gate's curl is aborted (CC killed, --max-time expired, server
+      // shutting down), reject so we don't leak the map entry forever.
+      signal.addEventListener(
+        "abort",
+        () => rejectDecision(new Error("gate_aborted")),
+        { once: true },
+      );
+      void emit("permission_request", {
+        request_id: requestId,
+        tool_name: hook.tool_name,
+        tool_input: hook.tool_input,
+        tool_use_id: hook.tool_use_id,
+      });
     });
-  });
 
-  await emit("permission_resolved", { request_id: requestId, decision });
+    await emit("permission_resolved", { request_id: requestId, decision });
 
-  return c.json({
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: decision,
-      permissionDecisionReason:
-        decision === "allow"
-          ? "operator approved via cc-deck"
-          : "operator denied via cc-deck",
-    },
-  });
+    return c.json({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: decision,
+        permissionDecisionReason:
+          decision === "allow"
+            ? "operator approved via cc-deck"
+            : "operator denied via cc-deck",
+      },
+    });
+  } catch {
+    // Gate aborted before a decision arrived. Clean up the map entry and
+    // notify connected UI clients so the card clears.
+    if (pendingApprovals.delete(requestId)) {
+      await emit("permission_resolved", {
+        request_id: requestId,
+        decision: "deny",
+        reason: "gate_aborted",
+      });
+    }
+    return c.json({ error: "gate aborted" }, 408);
+  }
 });
 
 app.post("/approval", async (c) => {
@@ -334,7 +372,7 @@ const cmd = [
 
 await emit("session_started", { command: cmd, workdir, sessionId });
 
-let proc: ReturnType<typeof Bun.spawn>;
+let proc: ReturnType<typeof Bun.spawn> | null = null;
 try {
   proc = Bun.spawn({
     cmd,
@@ -384,8 +422,11 @@ async function* readLines(
 
 // === pipe subprocess stdout → envelope events ===
 
-const procStdout = proc.stdout as ReadableStream<Uint8Array>;
-const procStderr = proc.stderr as ReadableStream<Uint8Array>;
+// Narrow past the null state; if spawn failed we'd have exited above.
+if (!proc) process.exit(1);
+const activeProc = proc;
+const procStdout = activeProc.stdout as ReadableStream<Uint8Array>;
+const procStderr = activeProc.stderr as ReadableStream<Uint8Array>;
 
 (async () => {
   for await (const line of readLines(procStdout)) {
@@ -416,7 +457,7 @@ const procStderr = proc.stderr as ReadableStream<Uint8Array>;
 let shutdownSignalReceived = false;
 
 (async () => {
-  const code = await proc.exited;
+  const code = await activeProc.exited;
   await emit("subprocess_exited", {
     code,
     reason: shutdownSignalReceived
@@ -435,6 +476,6 @@ let shutdownSignalReceived = false;
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     shutdownSignalReceived = true;
-    proc.kill();
+    activeProc.kill();
   });
 }
