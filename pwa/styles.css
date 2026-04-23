@@ -335,10 +335,12 @@ body {
   cursor: not-allowed;
 }
 
-/* === desktop: wider container, denser cards === */
+/* === desktop: wider container, denser cards, inline input === */
 @media (min-width: 1024px) {
   .app {
     max-width: 1200px;
+    /* No fixed-bottom input to reserve space for at desktop widths. */
+    padding-bottom: env(safe-area-inset-bottom);
   }
 
   .card {
@@ -359,5 +361,20 @@ body {
 
   .notice {
     font-size: 0.78rem;
+  }
+
+  .input-bar {
+    position: static;
+    margin: 0.75rem 0 1rem;
+    padding: 0.75rem;
+    border: 1px solid #2a2a2a;
+    border-radius: 10px;
+    background: #151515;
+  }
+  .input-bar textarea {
+    /* Desktop has room for a multi-line default — less cramped than the
+       mobile rows={1} single-line start. */
+    min-height: 5rem;
+    max-height: 16rem;
   }
 }

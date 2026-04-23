@@ -21,6 +21,10 @@ export function App() {
     () => new Map(),
   );
   const seenIds = useRef<Set<number>>(new Set());
+  const endRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [events.length]);
 
   useEffect(() => {
     const es = new EventSource("/stream");
@@ -60,6 +64,11 @@ export function App() {
       <TopBar status={status} eventCount={events.length} />
       <EventList events={events} resolutions={resolutions} />
       <InputBox />
+      {/* Scroll sentinel lives after InputBox so auto-scroll keeps the input
+          visible on desktop (where the input is inline, not fixed). On mobile
+          the input is position:fixed, so this sits behind the overlay, which
+          is harmless. */}
+      <div ref={endRef} aria-hidden="true" />
     </div>
   );
 }
@@ -86,16 +95,11 @@ function EventList({
   events: EnvelopeEvent[];
   resolutions: ResolutionMap;
 }) {
-  const endRef = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [events.length]);
   return (
     <div className="events">
       {events.map((e) => (
         <EventRow key={e.id} event={e} resolutions={resolutions} />
       ))}
-      <div ref={endRef} />
     </div>
   );
 }
