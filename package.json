@@ -1,0 +1,19 @@
+{
+  "name": "cc-deck",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mobile command center for Claude Code",
+  "scripts": {
+    "dev": "bun run --hot server.ts",
+    "start": "bun run server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.2"
+  }
+}

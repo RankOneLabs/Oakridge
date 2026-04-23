@@ -1,0 +1,12 @@
+node_modules/
+data/
+pwa/dist/
+.claude/settings.local.json
+
+*.db
+*.jsonl
+.env
+.env.*
+
+.DS_Store
+*.log
