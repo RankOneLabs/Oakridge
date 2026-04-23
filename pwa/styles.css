@@ -68,7 +68,7 @@ body {
   /* Shown only at desktop widths — below that, screen real estate is at a
      premium and the id isn't operator-actionable info. */
   display: none;
-  color: #666;
+  color: #999;
   font-family: "SF Mono", Menlo, monospace;
   font-size: 0.75rem;
 }
@@ -76,7 +76,7 @@ body {
 .input-hint {
   /* Desktop-only keyboard hint next to the inline input. Hidden by default. */
   display: none;
-  color: #666;
+  color: #999;
   font-size: 0.75rem;
   padding: 0 0.25rem;
 }
@@ -84,7 +84,8 @@ body {
 /* Consistent keyboard focus indicator across interactive elements. */
 .input-bar button:focus-visible,
 .card-permission-buttons button:focus-visible,
-.card summary:focus-visible {
+.card summary:focus-visible,
+.row-thinking summary:focus-visible {
   outline: 2px solid #2563eb;
   outline-offset: 2px;
 }

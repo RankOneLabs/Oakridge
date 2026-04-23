@@ -20,6 +20,7 @@ export function App() {
   const [resolutions, setResolutions] = useState<ResolutionMap>(
     () => new Map(),
   );
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const seenIds = useRef<Set<number>>(new Set());
   const endRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -52,6 +53,14 @@ export function App() {
             });
           }
         }
+        if (evt.type === "session_started") {
+          const p = evt.payload as { sessionId?: unknown };
+          // Latest session_started wins — after a reconnect, the server's
+          // current session id replaces any stale one from catchup.
+          if (typeof p.sessionId === "string") {
+            setSessionId(p.sessionId);
+          }
+        }
       } catch {
         // malformed frame; ignore
       }
@@ -59,17 +68,12 @@ export function App() {
     return () => es.close();
   }, []);
 
-  const sessionStarted = events.find((e) => e.type === "session_started");
-  const sessionId = sessionStarted
-    ? (sessionStarted.payload as { sessionId?: string }).sessionId
-    : null;
-
   return (
     <div className="app">
       <TopBar
         status={status}
         eventCount={events.length}
-        sessionId={sessionId ?? null}
+        sessionId={sessionId}
       />
       <EventList events={events} resolutions={resolutions} />
       <InputBox />
@@ -96,7 +100,11 @@ function TopBar({
       <span className={`status status-${status}`}>{status}</span>
       <span className="event-count">{eventCount} events</span>
       {sessionId && (
-        <span className="session-id" title={`session ${sessionId}`}>
+        <span
+          className="session-id"
+          title={`session ${sessionId}`}
+          aria-label={`Session ID ${sessionId}`}
+        >
           {sessionId.slice(0, 8)}
         </span>
       )}
