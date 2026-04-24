@@ -72,8 +72,11 @@
   --text-muted: #6b7280;
   --text-session: #6b7280;
   --text-faint: #6b7280;
-  --text-fainter: #9ca3af;
-  --text-faintest: #b0b5bc;
+  /* On white the AA-passing gray range (>=4.5:1) is narrow, so the three
+     "quiet" tiers below --text-muted collapse into one color instead of
+     taking the dark palette's stepped hierarchy under the AA floor. */
+  --text-fainter: #6b7280;
+  --text-faintest: #6b7280;
 
   --bubble-user-bg: #2563eb;
   --bubble-user-fg: #ffffff;
