@@ -137,19 +137,31 @@ function TopBar({
   yoloMode: boolean;
 }) {
   const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   async function toggleYolo() {
     if (pending) return;
     setPending(true);
+    setError(null);
     try {
-      await fetch("/yolo", {
+      const res = await fetch("/yolo", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ enabled: !yoloMode }),
       });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        setError(
+          typeof body?.error === "string"
+            ? body.error
+            : `server returned ${res.status}`,
+        );
+      }
       // Don't optimistically flip — wait for the yolo_mode_changed event so
       // every connected client sees the same state at the same time.
-    } catch {
-      // Surface failure quietly; the toggle just won't flip.
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "network error");
     } finally {
       setPending(false);
     }
@@ -172,6 +184,11 @@ function TopBar({
       >
         {yoloMode ? "YOLO ON" : "YOLO"}
       </button>
+      {error && (
+        <span className="yolo-error" title={error} role="alert">
+          ⚠ {error}
+        </span>
+      )}
       {sessionId && (
         <span
           className="session-id"

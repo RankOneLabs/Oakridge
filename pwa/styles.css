@@ -69,13 +69,25 @@ body {
   color: #888;
   border: 1px solid #2a2a2a;
   border-radius: 4px;
-  padding: 0.25rem 0.55rem;
+  padding: 0.25rem 0.75rem;
   font: inherit;
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
   cursor: pointer;
-  min-height: 28px;
+  /* 44px to meet touch-target guidance — this is the most security-relevant
+     control in the top bar, so reliable tap matters more than blending in
+     with the smaller status pill / event count text next to it. */
+  min-height: 44px;
+}
+
+.yolo-error {
+  color: #e67070;
+  font-size: 0.75rem;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .yolo-toggle:hover:not(:disabled) {
   border-color: #3a3a3a;

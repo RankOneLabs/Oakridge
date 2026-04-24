@@ -442,18 +442,26 @@ app.post("/approval", async (c) => {
   pending.resolve(body.decision === "approve" ? "allow" : "deny");
 
   // "Always" only applies to approves — denying never adds to the allowlist.
+  // The pending request is already resolved at this point, so the underlying
+  // tool will run regardless of what happens here. Treat the allowlist work
+  // as a soft side-effect: if it fails, log and degrade to "we'll prompt
+  // again next time" rather than 500ing a request that effectively succeeded.
   if (body.scope === "always" && body.decision === "approve") {
-    if (!allowedTools.has(pending.toolName)) {
-      // Emit before mutating so server state never diverges from what a
-      // reconnecting client can rebuild via JSONL replay. If emit throws
-      // (disk full, perm error), the allowlist stays unchanged and the
-      // error surfaces to the caller.
-      await emit("tool_allowlisted", { tool_name: pending.toolName });
-      allowedTools.add(pending.toolName);
+    try {
+      if (!allowedTools.has(pending.toolName)) {
+        // Emit before mutating so server state never diverges from what a
+        // reconnecting client can rebuild via JSONL replay.
+        await emit("tool_allowlisted", { tool_name: pending.toolName });
+        allowedTools.add(pending.toolName);
+      }
+      // Drain any other parked requests for the same tool so the operator
+      // doesn't have to tap through them individually.
+      drainParkedFor((p) => p.toolName === pending.toolName);
+    } catch (err) {
+      console.error(
+        `cc-deck: allowlist side-effect for ${pending.toolName} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
-    // Drain any other parked requests for the same tool so the operator
-    // doesn't have to tap through them individually.
-    drainParkedFor((p) => p.toolName === pending.toolName);
   }
   return c.json({ ok: true });
 });
