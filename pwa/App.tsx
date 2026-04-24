@@ -1,4 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Markdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 
@@ -8,6 +15,30 @@ export interface EnvelopeEvent {
   ts: string;
   payload: unknown;
 }
+
+type SessionStatus = "starting" | "live" | "ended";
+
+interface SessionSnapshot {
+  sid: string;
+  workdir: string;
+  status: SessionStatus;
+  createdAt: string;
+  lastActivityTs: string;
+  ccSid: string | null;
+  parentCcSid: string | null;
+  parentOakridgeSid: string | null;
+  pendingCount: number;
+  yoloMode: boolean;
+  allowedTools: string[];
+}
+
+type InboxDelta =
+  | { type: "session_created"; session: SessionSnapshot }
+  | { type: "session_ended"; sid: string }
+  | { type: "status_changed"; sid: string; status: SessionStatus }
+  | { type: "pending_count_changed"; sid: string; count: number }
+  | { type: "last_activity_changed"; sid: string; ts: string }
+  | { type: "yolo_changed"; sid: string; yoloMode: boolean };
 
 type Status = "connecting" | "connected" | "disconnected";
 type Theme = "dark" | "light";
@@ -24,9 +55,38 @@ function readStoredTheme(): Theme {
   return "dark";
 }
 
-export function App() {
-  const [events, setEvents] = useState<EnvelopeEvent[]>([]);
-  const [status, setStatus] = useState<Status>("connecting");
+function readHashSid(): string | null {
+  const hash = window.location.hash.slice(1);
+  if (!hash) return null;
+  const params = new URLSearchParams(hash);
+  return params.get("sid");
+}
+
+function writeHashSid(sid: string | null): void {
+  if (sid === null) {
+    // history.replaceState so hitting Back from a SessionView returns to the
+    // prior tab/page rather than chaining through every sid the user viewed.
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  } else {
+    window.location.hash = `sid=${encodeURIComponent(sid)}`;
+  }
+}
+
+function useHashSid(): [string | null, (sid: string | null) => void] {
+  const [sid, setSid] = useState<string | null>(() => readHashSid());
+  useEffect(() => {
+    const onHash = () => setSid(readHashSid());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const navigate = (next: string | null) => {
+    writeHashSid(next);
+    setSid(next);
+  };
+  return [sid, navigate];
+}
+
+function useTheme(): [Theme, () => void] {
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -34,13 +94,402 @@ export function App() {
       localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch {}
   }, [theme]);
-  // Maintain the resolutions map incrementally (O(1) per event) rather than
-  // recomputing across the whole events array on every render.
+  return [theme, () => setTheme((p) => (p === "dark" ? "light" : "dark"))];
+}
+
+interface InboxState {
+  sessions: Map<string, SessionSnapshot>;
+  /**
+   * Sids the server currently has in memory (live or ended-but-lingering).
+   * Differs from `sessions.keys()` because archived-only entries from the
+   * /sessions?include=archived fetch aren't in memory. Used to decide whether
+   * a SessionView can open /:sid/stream (in-memory) or must fall back to the
+   * one-shot /:sid/events (archived on disk).
+   */
+  inMemorySids: Set<string>;
+  inboxStatus: Status;
+  /**
+   * Fold a snapshot we already have in hand (e.g. the response body of
+   * POST /sessions) into the inbox state so the destination view mounts
+   * with the correct snapshot instead of racing the /inbox delta. Safe
+   * to call before /inbox actually delivers session_created — the delta
+   * just re-seats the same entry.
+   */
+  hydrateSession: (snapshot: SessionSnapshot) => void;
+}
+
+function useInbox(): InboxState {
+  const [sessions, setSessions] = useState<Map<string, SessionSnapshot>>(
+    () => new Map(),
+  );
+  const [inMemorySids, setInMemorySids] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [inboxStatus, setInboxStatus] = useState<Status>("connecting");
+
+  const hydrateSession = useCallback((snapshot: SessionSnapshot) => {
+    setSessions((prev) => {
+      const next = new Map(prev);
+      next.set(snapshot.sid, snapshot);
+      return next;
+    });
+    setInMemorySids((prev) => {
+      if (prev.has(snapshot.sid)) return prev;
+      const next = new Set(prev);
+      next.add(snapshot.sid);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    // Seed with the full list (in-memory + archived). The inbox snapshot
+    // that arrives below will overwrite in-memory entries with fresher
+    // copies; archived-only entries carry over untouched.
+    fetch("/sessions?include=archived")
+      .then((r) => r.json() as Promise<{ sessions: SessionSnapshot[] }>)
+      .then((data) => {
+        if (cancelled) return;
+        setSessions((prev) => {
+          const next = new Map(prev);
+          for (const s of data.sessions) {
+            if (!next.has(s.sid)) next.set(s.sid, s);
+          }
+          return next;
+        });
+        // Seed inMemorySids with every non-ended sid so SessionView picks
+        // /:sid/stream (SSE) over one-shot /:sid/events when the user
+        // clicks a live session before the /inbox SSE has connected. Only
+        // non-ended sids: archived-on-disk entries (always status=ended)
+        // would otherwise be incorrectly marked as in-memory.
+        setInMemorySids((prev) => {
+          const next = new Set(prev);
+          for (const s of data.sessions) {
+            if (s.status !== "ended") next.add(s.sid);
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        // Network error; the inbox subscription below still provides live
+        // state, it just won't show prior-run archived sessions.
+      });
+
+    const es = new EventSource("/inbox");
+    es.onopen = () => setInboxStatus("connected");
+    es.onerror = () => setInboxStatus("disconnected");
+    es.addEventListener("snapshot", (e) => {
+      const data = JSON.parse((e as MessageEvent).data) as {
+        sessions: SessionSnapshot[];
+      };
+      setSessions((prev) => {
+        const next = new Map(prev);
+        for (const s of data.sessions) next.set(s.sid, s);
+        return next;
+      });
+      setInMemorySids(new Set(data.sessions.map((s) => s.sid)));
+    });
+    es.addEventListener("delta", (e) => {
+      const delta = JSON.parse((e as MessageEvent).data) as InboxDelta;
+      setSessions((prev) => applyDelta(prev, delta));
+      if (delta.type === "session_created") {
+        setInMemorySids((prev) => {
+          if (prev.has(delta.session.sid)) return prev;
+          const next = new Set(prev);
+          next.add(delta.session.sid);
+          return next;
+        });
+      }
+      // session_ended keeps the sid in inMemorySids: ended sessions linger
+      // in the manager map (and stream/events still work against them)
+      // until the server process exits.
+    });
+
+    return () => {
+      cancelled = true;
+      es.close();
+    };
+  }, []);
+
+  return { sessions, inMemorySids, inboxStatus, hydrateSession };
+}
+
+function applyDelta(
+  prev: Map<string, SessionSnapshot>,
+  delta: InboxDelta,
+): Map<string, SessionSnapshot> {
+  const next = new Map(prev);
+  switch (delta.type) {
+    case "session_created":
+      next.set(delta.session.sid, delta.session);
+      break;
+    case "session_ended": {
+      const s = next.get(delta.sid);
+      if (s) next.set(delta.sid, { ...s, status: "ended", pendingCount: 0 });
+      break;
+    }
+    case "status_changed": {
+      const s = next.get(delta.sid);
+      if (s) next.set(delta.sid, { ...s, status: delta.status });
+      break;
+    }
+    case "pending_count_changed": {
+      const s = next.get(delta.sid);
+      if (s) next.set(delta.sid, { ...s, pendingCount: delta.count });
+      break;
+    }
+    case "last_activity_changed": {
+      const s = next.get(delta.sid);
+      if (s) next.set(delta.sid, { ...s, lastActivityTs: delta.ts });
+      break;
+    }
+    case "yolo_changed": {
+      const s = next.get(delta.sid);
+      if (s) next.set(delta.sid, { ...s, yoloMode: delta.yoloMode });
+      break;
+    }
+  }
+  return next;
+}
+
+export function App() {
+  const [sid, navigate] = useHashSid();
+  const [theme, toggleTheme] = useTheme();
+  const { sessions, inMemorySids, inboxStatus, hydrateSession } = useInbox();
+
+  if (sid === null) {
+    return (
+      <SessionListView
+        sessions={sessions}
+        inboxStatus={inboxStatus}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onSelect={(nextSid) => navigate(nextSid)}
+        onHydrateSession={hydrateSession}
+      />
+    );
+  }
+  return (
+    <SessionView
+      sid={sid}
+      snapshot={sessions.get(sid) ?? null}
+      inMemory={inMemorySids.has(sid)}
+      inboxStatus={inboxStatus}
+      theme={theme}
+      onToggleTheme={toggleTheme}
+      onBack={() => navigate(null)}
+    />
+  );
+}
+
+// === session list ===
+
+function SessionListView({
+  sessions,
+  inboxStatus,
+  theme,
+  onToggleTheme,
+  onSelect,
+  onHydrateSession,
+}: {
+  sessions: Map<string, SessionSnapshot>;
+  inboxStatus: Status;
+  theme: Theme;
+  onToggleTheme: () => void;
+  onSelect: (sid: string) => void;
+  onHydrateSession: (snapshot: SessionSnapshot) => void;
+}) {
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const sorted = useMemo(() => sortSessions(sessions), [sessions]);
+
+  async function createSession() {
+    if (creating) return;
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const res = await fetch("/sessions", { method: "POST" });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        setCreateError(
+          typeof body?.error === "string"
+            ? body.error
+            : `server returned ${res.status}`,
+        );
+        return;
+      }
+      const snap = (await res.json()) as SessionSnapshot;
+      // Hydrate before navigating so SessionView mounts with the snapshot
+      // present and inMemory=true, rather than racing the /inbox
+      // session_created delta. Without this the input box is hidden and
+      // the stream falls back to one-shot /events for the first ~100ms.
+      onHydrateSession(snap);
+      onSelect(snap.sid);
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : "network error");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div className="app app-list">
+      <header className="top-bar">
+        <span className={`status status-${inboxStatus}`}>{inboxStatus}</span>
+        <span className="event-count">
+          {sorted.length} {sorted.length === 1 ? "session" : "sessions"}
+        </span>
+        <button
+          type="button"
+          className="theme-toggle"
+          onClick={onToggleTheme}
+          title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          aria-label={
+            theme === "dark" ? "Switch to light mode" : "Switch to dark mode"
+          }
+        >
+          {theme === "dark" ? "LIGHT" : "DARK"}
+        </button>
+      </header>
+      <div className="session-list-actions">
+        <button
+          type="button"
+          className="btn-new-session"
+          onClick={() => void createSession()}
+          disabled={creating}
+        >
+          {creating ? "starting…" : "+ New session"}
+        </button>
+        {createError && (
+          <div className="input-error" role="alert">
+            error: {createError}
+          </div>
+        )}
+      </div>
+      {sorted.length === 0 ? (
+        <div className="session-list-empty">No sessions yet.</div>
+      ) : (
+        <ul className="session-list">
+          {sorted.map((s) => (
+            <SessionRow
+              key={s.sid}
+              snapshot={s}
+              onClick={() => onSelect(s.sid)}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function sortSessions(sessions: Map<string, SessionSnapshot>): SessionSnapshot[] {
+  // Sort by last activity, newest first. Pending-approval sessions don't
+  // float — the pending badge is visible enough, and operators told us
+  // they'd rather preserve predictable chronological order.
+  return [...sessions.values()].sort((a, b) => {
+    if (a.lastActivityTs === b.lastActivityTs) return 0;
+    return a.lastActivityTs < b.lastActivityTs ? 1 : -1;
+  });
+}
+
+function SessionRow({
+  snapshot,
+  onClick,
+}: {
+  snapshot: SessionSnapshot;
+  onClick: () => void;
+}) {
+  const relative = useRelativeTime(snapshot.lastActivityTs);
+  return (
+    <li>
+      <button
+        type="button"
+        className={`session-row session-row-${snapshot.status}`}
+        onClick={onClick}
+      >
+        <div className="session-row-line">
+          <span className={`session-row-status session-row-status-${snapshot.status}`}>
+            {snapshot.status}
+          </span>
+          <span className="session-row-sid" title={snapshot.sid}>
+            {snapshot.sid.slice(0, 8)}
+          </span>
+          {snapshot.pendingCount > 0 && (
+            <span className="session-row-pending" aria-label={`${snapshot.pendingCount} pending approvals`}>
+              {snapshot.pendingCount} pending
+            </span>
+          )}
+          {snapshot.yoloMode && (
+            <span className="session-row-yolo">YOLO</span>
+          )}
+          <span className="session-row-activity">{relative}</span>
+        </div>
+        <div className="session-row-workdir" title={snapshot.workdir}>
+          {snapshot.workdir}
+        </div>
+      </button>
+    </li>
+  );
+}
+
+function useRelativeTime(iso: string): string {
+  // Re-render once per minute so "2m ago" doesn't get stale. A 60s tick is
+  // coarse enough to stay off the render hot path but fine-grained enough
+  // that operators see the list refresh before the data feels wrong.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 60_000);
+    return () => clearInterval(t);
+  }, []);
+  return formatRelative(iso);
+}
+
+function formatRelative(iso: string): string {
+  if (!iso) return "";
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return "";
+  const deltaSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (deltaSec < 5) return "just now";
+  if (deltaSec < 60) return `${deltaSec}s ago`;
+  // Floor rather than round for the larger unit conversions — a 1m30s-old
+  // session showing as "2m ago" overstates the elapsed time. Labels
+  // advance only once the next threshold is actually crossed.
+  const mins = Math.floor(deltaSec / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// === session view ===
+
+function SessionView({
+  sid,
+  snapshot,
+  inMemory,
+  inboxStatus,
+  theme,
+  onToggleTheme,
+  onBack,
+}: {
+  sid: string;
+  snapshot: SessionSnapshot | null;
+  inMemory: boolean;
+  inboxStatus: Status;
+  theme: Theme;
+  onToggleTheme: () => void;
+  onBack: () => void;
+}) {
+  const [events, setEvents] = useState<EnvelopeEvent[]>([]);
+  const [streamStatus, setStreamStatus] = useState<Status>("connecting");
   const [resolutions, setResolutions] = useState<ResolutionMap>(
     () => new Map(),
   );
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  // Auto-approve state, replayed from the server's event log on connect.
   const [yoloMode, setYoloMode] = useState(false);
   const [allowedTools, setAllowedTools] = useState<Set<string>>(
     () => new Set(),
@@ -51,126 +500,156 @@ export function App() {
     endRef.current?.scrollIntoView({ block: "end" });
   }, [events.length]);
 
+  // Reset per-session state when navigating between sids so stale events
+  // from the previous session's EventSource don't leak into this view.
   useEffect(() => {
-    const es = new EventSource("/stream");
-    es.onopen = () => setStatus("connected");
-    es.onerror = () => setStatus("disconnected");
+    setEvents([]);
+    setResolutions(new Map());
+    setYoloMode(false);
+    setAllowedTools(new Set());
+    seenIds.current = new Set();
+  }, [sid]);
+
+  useEffect(() => {
+    const ingest = (evt: EnvelopeEvent) => {
+      if (seenIds.current.has(evt.id)) return;
+      seenIds.current.add(evt.id);
+      setEvents((prev) => [...prev, evt]);
+      if (evt.type === "permission_resolved") {
+        const p = evt.payload as {
+          request_id?: string;
+          decision?: "allow" | "deny";
+        };
+        if (p.request_id && p.decision) {
+          const requestId = p.request_id;
+          const decision = p.decision;
+          setResolutions((prev) => {
+            if (prev.get(requestId) === decision) return prev;
+            const next = new Map(prev);
+            next.set(requestId, decision);
+            return next;
+          });
+        }
+      }
+      if (evt.type === "yolo_mode_changed") {
+        const p = evt.payload as { enabled?: unknown };
+        if (typeof p.enabled === "boolean") setYoloMode(p.enabled);
+      }
+      if (evt.type === "tool_allowlisted") {
+        const p = evt.payload as { tool_name?: unknown };
+        if (typeof p.tool_name === "string") {
+          const name = p.tool_name;
+          setAllowedTools((prev) => {
+            if (prev.has(name)) return prev;
+            const next = new Set(prev);
+            next.add(name);
+            return next;
+          });
+        }
+      }
+    };
+
+    if (!inMemory) {
+      // Archived-on-disk session: no live stream, one-shot fetch. If the
+      // /inbox reconnects later and learns the session is in-memory after
+      // all (rare race at server startup), this effect re-runs and upgrades
+      // to SSE.
+      setStreamStatus("connecting");
+      let cancelled = false;
+      fetch(`/${encodeURIComponent(sid)}/events`)
+        .then((r) => {
+          if (!r.ok) throw new Error(`server returned ${r.status}`);
+          return r.json() as Promise<{ events: EnvelopeEvent[] }>;
+        })
+        .then((data) => {
+          if (cancelled) return;
+          for (const evt of data.events) ingest(evt);
+          setStreamStatus("disconnected");
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setStreamStatus("disconnected");
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const es = new EventSource(`/${encodeURIComponent(sid)}/stream`);
+    es.onopen = () => setStreamStatus("connected");
+    es.onerror = () => setStreamStatus("disconnected");
     es.onmessage = (e) => {
       try {
-        const evt = JSON.parse(e.data) as EnvelopeEvent;
-        if (seenIds.current.has(evt.id)) return;
-        seenIds.current.add(evt.id);
-        setEvents((prev) => [...prev, evt]);
-        if (evt.type === "permission_resolved") {
-          const p = evt.payload as {
-            request_id?: string;
-            decision?: "allow" | "deny";
-          };
-          if (p.request_id && p.decision) {
-            const requestId = p.request_id;
-            const decision = p.decision;
-            setResolutions((prev) => {
-              if (prev.get(requestId) === decision) return prev;
-              const next = new Map(prev);
-              next.set(requestId, decision);
-              return next;
-            });
-          }
-        }
-        if (evt.type === "session_started") {
-          const p = evt.payload as { sessionId?: unknown };
-          // Latest session_started wins — after a reconnect, the server's
-          // current session id replaces any stale one from catchup.
-          if (typeof p.sessionId === "string") {
-            const nextSessionId = p.sessionId;
-            setSessionId((prev) => {
-              // If the session actually changed (e.g. server restarted
-              // mid-EventSource-reconnect), clear session-scoped auto-
-              // approve state so the prior session's yolo/allowlist
-              // doesn't leak into the new one. Subsequent yolo_mode_changed
-              // and tool_allowlisted events for the new session will
-              // re-establish state if needed.
-              if (prev !== null && prev !== nextSessionId) {
-                setYoloMode(false);
-                setAllowedTools(new Set());
-              }
-              return nextSessionId;
-            });
-          }
-        }
-        if (evt.type === "yolo_mode_changed") {
-          const p = evt.payload as { enabled?: unknown };
-          if (typeof p.enabled === "boolean") setYoloMode(p.enabled);
-        }
-        if (evt.type === "tool_allowlisted") {
-          const p = evt.payload as { tool_name?: unknown };
-          if (typeof p.tool_name === "string") {
-            const name = p.tool_name;
-            setAllowedTools((prev) => {
-              if (prev.has(name)) return prev;
-              const next = new Set(prev);
-              next.add(name);
-              return next;
-            });
-          }
-        }
+        ingest(JSON.parse(e.data) as EnvelopeEvent);
       } catch {
         // malformed frame; ignore
       }
     };
     return () => es.close();
-  }, []);
+  }, [sid, inMemory]);
 
+  const canInput = snapshot?.status === "live";
   return (
     <div className="app">
-      <TopBar
-        status={status}
+      <SessionTopBar
+        sid={sid}
+        snapshot={snapshot}
+        streamStatus={streamStatus}
+        inboxStatus={inboxStatus}
         eventCount={events.length}
-        sessionId={sessionId}
         yoloMode={yoloMode}
         theme={theme}
-        onToggleTheme={() =>
-          setTheme((prev) => (prev === "dark" ? "light" : "dark"))
-        }
+        onToggleTheme={onToggleTheme}
+        onBack={onBack}
       />
       <EventList
         events={events}
         resolutions={resolutions}
         allowedTools={allowedTools}
+        sid={sid}
+        sessionStatus={snapshot?.status ?? null}
       />
-      <InputBox />
-      {/* Scroll sentinel lives after InputBox so auto-scroll keeps the input
-          visible on desktop (where the input is inline, not fixed). On mobile
-          the input is position:fixed, so this sits behind the overlay, which
-          is harmless. */}
+      {canInput && <InputBox sid={sid} />}
+      {!canInput && snapshot?.status === "ended" && (
+        <div className="session-ended-banner">
+          Session ended · read-only transcript
+        </div>
+      )}
       <div ref={endRef} aria-hidden="true" />
     </div>
   );
 }
 
-function TopBar({
-  status,
+function SessionTopBar({
+  sid,
+  snapshot,
+  streamStatus,
+  inboxStatus,
   eventCount,
-  sessionId,
   yoloMode,
   theme,
   onToggleTheme,
+  onBack,
 }: {
-  status: Status;
+  sid: string;
+  snapshot: SessionSnapshot | null;
+  streamStatus: Status;
+  inboxStatus: Status;
   eventCount: number;
-  sessionId: string | null;
   yoloMode: boolean;
   theme: Theme;
   onToggleTheme: () => void;
+  onBack: () => void;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const canToggleYolo = snapshot?.status === "live";
   async function toggleYolo() {
-    if (pending) return;
+    if (pending || !canToggleYolo) return;
     setPending(true);
     setError(null);
     try {
-      const res = await fetch("/yolo", {
+      const res = await fetch(`/${encodeURIComponent(sid)}/yolo`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ enabled: !yoloMode }),
@@ -185,31 +664,36 @@ function TopBar({
             : `server returned ${res.status}`,
         );
       }
-      // Don't optimistically flip — wait for the yolo_mode_changed event so
-      // every connected client sees the same state at the same time.
     } catch (err) {
       setError(err instanceof Error ? err.message : "network error");
     } finally {
       setPending(false);
     }
   }
+  // Show stream status when on a live session, inbox status otherwise —
+  // stream status on an archived-only view is misleading ("disconnected"
+  // just means the one-shot fetch finished).
+  const shownStatus = snapshot?.status === "live" ? streamStatus : inboxStatus;
   return (
     <header className="top-bar">
-      <span className={`status status-${status}`}>{status}</span>
+      <button
+        type="button"
+        className="back-button"
+        onClick={onBack}
+        aria-label="Back to session list"
+        title="Back to session list"
+      >
+        ←
+      </button>
+      <span className={`status status-${shownStatus}`}>{shownStatus}</span>
       <span className="event-count">{eventCount} events</span>
       <button
         type="button"
         className="theme-toggle"
         onClick={onToggleTheme}
-        title={
-          theme === "dark"
-            ? "Switch to light mode"
-            : "Switch to dark mode"
-        }
+        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
         aria-label={
-          theme === "dark"
-            ? "Switch to light mode"
-            : "Switch to dark mode"
+          theme === "dark" ? "Switch to light mode" : "Switch to dark mode"
         }
       >
         {theme === "dark" ? "LIGHT" : "DARK"}
@@ -218,11 +702,13 @@ function TopBar({
         type="button"
         className={`yolo-toggle ${yoloMode ? "is-on" : ""}`}
         onClick={() => void toggleYolo()}
-        disabled={pending}
+        disabled={pending || !canToggleYolo}
         title={
-          yoloMode
-            ? "YOLO mode on — every tool call auto-approves"
-            : "Tap to enable YOLO mode (auto-approve every tool call)"
+          !canToggleYolo
+            ? "YOLO only toggleable while the session is live"
+            : yoloMode
+              ? "YOLO mode on — every tool call auto-approves"
+              : "Tap to enable YOLO mode (auto-approve every tool call)"
         }
         aria-pressed={yoloMode}
       >
@@ -233,15 +719,13 @@ function TopBar({
           ⚠ {error}
         </span>
       )}
-      {sessionId && (
-        <span
-          className="session-id"
-          title={`session ${sessionId}`}
-          aria-label={`Session ID ${sessionId}`}
-        >
-          {sessionId.slice(0, 8)}
-        </span>
-      )}
+      <span
+        className="session-id"
+        title={`session ${sid}`}
+        aria-label={`Session ID ${sid}`}
+      >
+        {sid.slice(0, 8)}
+      </span>
     </header>
   );
 }
@@ -250,10 +734,14 @@ function EventList({
   events,
   resolutions,
   allowedTools,
+  sid,
+  sessionStatus,
 }: {
   events: EnvelopeEvent[];
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
+  sid: string;
+  sessionStatus: SessionStatus | null;
 }) {
   return (
     <div className="events">
@@ -263,6 +751,8 @@ function EventList({
           event={e}
           resolutions={resolutions}
           allowedTools={allowedTools}
+          sid={sid}
+          sessionStatus={sessionStatus}
         />
       ))}
     </div>
@@ -273,10 +763,14 @@ function EventRow({
   event,
   resolutions,
   allowedTools,
+  sid,
+  sessionStatus,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
+  sid: string;
+  sessionStatus: SessionStatus | null;
 }) {
   switch (event.type) {
     case "user":
@@ -285,7 +779,13 @@ function EventRow({
       return <AssistantRow event={event} />;
     case "permission_request":
       return (
-        <PermissionRow event={event} resolutions={resolutions} allowedTools={allowedTools} />
+        <PermissionRow
+          event={event}
+          resolutions={resolutions}
+          allowedTools={allowedTools}
+          sid={sid}
+          sessionStatus={sessionStatus}
+        />
       );
     case "permission_resolved":
       // folded into the matching permission_request card
@@ -455,10 +955,14 @@ function PermissionRow({
   event,
   resolutions,
   allowedTools,
+  sid,
+  sessionStatus,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
+  sid: string;
+  sessionStatus: SessionStatus | null;
 }) {
   const p = event.payload as PermissionRequestPayload;
   const resolution = resolutions.get(p.request_id);
@@ -475,6 +979,22 @@ function PermissionRow({
     );
   }
 
+  // Only collapse to a read-only notice when the session is definitively
+  // ended. For "starting" or a still-loading inbox snapshot (null), fall
+  // through to the normal buttons — realistic case is a brief window where
+  // the inbox hasn't delivered the snapshot yet, and the server will
+  // 404/503 if the operator taps before it's ready. "session ended"
+  // messaging is wrong for those cases.
+  if (sessionStatus === "ended") {
+    return (
+      <div className="row row-system">
+        <div className="notice notice-muted">
+          unresolved · {p.tool_name} (session ended)
+        </div>
+      </div>
+    );
+  }
+
   async function decide(
     decision: "approve" | "deny",
     scope: "once" | "always" = "once",
@@ -483,7 +1003,7 @@ function PermissionRow({
     setLocalPending(true);
     setLocalError(null);
     try {
-      const res = await fetch("/approval", {
+      const res = await fetch(`/${encodeURIComponent(sid)}/approval`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -623,7 +1143,7 @@ function UnknownRow({ event }: { event: EnvelopeEvent }) {
   );
 }
 
-function InputBox() {
+function InputBox({ sid }: { sid: string }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -634,7 +1154,7 @@ function InputBox() {
     setSending(true);
     setError(null);
     try {
-      const res = await fetch("/input", {
+      const res = await fetch(`/${encodeURIComponent(sid)}/input`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: payload }),

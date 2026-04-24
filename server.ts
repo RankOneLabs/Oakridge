@@ -11,6 +11,7 @@ import { SessionManager } from "./session-manager";
 import {
   Session,
   SessionNotReadyError,
+  readJsonlOrEmpty,
   type Decision,
   type EnvelopeEvent,
   type SpawnCmd,
@@ -114,7 +115,8 @@ const manager = new SessionManager({ sessionsDir, buildSpawnCmd });
 // === HTTP handlers ===
 
 async function streamForSession(session: Session, c: Context) {
-  const signal = c.req.raw.signal;
+  const clientSignal = c.req.raw.signal;
+  const endedSignal = session.endedSignal;
   const lastEventIdHeader = c.req.header("last-event-id");
   const parsedResumeId = lastEventIdHeader ? Number(lastEventIdHeader) : NaN;
   const resumeAfter = Number.isFinite(parsedResumeId) ? parsedResumeId : -1;
@@ -136,7 +138,12 @@ async function streamForSession(session: Session, c: Context) {
         n();
       }
     };
-    signal.addEventListener("abort", onAbort, { once: true });
+    clientSignal.addEventListener("abort", onAbort, { once: true });
+    // Close the stream when the session ends — otherwise a client that
+    // stays connected to an ended session sits in the empty-pending loop
+    // forever, leaking the SSE connection and (after many such ends) the
+    // subscribe slot. Either signal aborting is enough to exit the loop.
+    endedSignal.addEventListener("abort", onAbort, { once: true });
     const heartbeat = setInterval(() => {
       stream.write(": ping\n\n").catch(() => {});
     }, 15000);
@@ -162,7 +169,7 @@ async function streamForSession(session: Session, c: Context) {
           id: String(evt.id),
         });
       }
-      while (!signal.aborted) {
+      while (!clientSignal.aborted && !endedSignal.aborted) {
         if (pending.length === 0) {
           await new Promise<void>((r) => {
             notify = r;
@@ -178,9 +185,27 @@ async function streamForSession(session: Session, c: Context) {
           id: String(evt.id),
         });
       }
+      // Drain any events that arrived between the last pending.shift() and
+      // the abort so clients don't miss the final subprocess_exited frame.
+      // Only drain when the session ended but the client is still connected —
+      // if the client aborted, writing to the dead socket would just throw,
+      // and there's no one to miss the frame anyway.
+      if (endedSignal.aborted && !clientSignal.aborted) {
+        while (pending.length > 0) {
+          const evt = pending.shift()!;
+          if (evt.id <= sentUpTo) continue;
+          sentUpTo = evt.id;
+          await stream.writeSSE({
+            event: "message",
+            data: JSON.stringify(evt),
+            id: String(evt.id),
+          });
+        }
+      }
     } finally {
       clearInterval(heartbeat);
-      signal.removeEventListener("abort", onAbort);
+      clientSignal.removeEventListener("abort", onAbort);
+      endedSignal.removeEventListener("abort", onAbort);
       unsub();
     }
   });
@@ -193,6 +218,23 @@ async function eventsForSession(session: Session, c: Context) {
     return c.json({ error: "invalid since" }, 400);
   }
   const contents = await session.readJsonl();
+  return c.json({
+    session_id: session.oakridgeSid,
+    events: parseEventsSince(contents, since),
+  });
+}
+
+// UUID v4 specifically — sids come from crypto.randomUUID(), which always
+// produces v4. Accepting other versions would be dead space that never
+// matches any real sid the server wrote.
+const SID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidSid(sid: string): boolean {
+  return SID_PATTERN.test(sid);
+}
+
+function parseEventsSince(contents: string, since: number): EnvelopeEvent[] {
   const events: EnvelopeEvent[] = [];
   for (const line of contents.split("\n")) {
     if (!line.trim()) continue;
@@ -207,7 +249,7 @@ async function eventsForSession(session: Session, c: Context) {
     }
     if (evt.id > since) events.push(evt);
   }
-  return c.json({ session_id: session.oakridgeSid, events });
+  return events;
 }
 
 async function inputForSession(session: Session, c: Context) {
@@ -510,9 +552,32 @@ app.get("/:sid/stream", (c) => {
 });
 
 app.get("/:sid/events", async (c) => {
-  const session = manager.get(c.req.param("sid"));
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  return eventsForSession(session, c);
+  const sid = c.req.param("sid");
+  // Validate sid before falling through to the filesystem — the archived
+  // path joins sid into sessionsDir, and a URL-encoded traversal like
+  // `..%2F..%2Fetc%2Fpasswd` would otherwise let a tailnet peer read
+  // arbitrary *.jsonl files the server has access to. sids are generated
+  // by randomUUID() so a strict UUID-v4 regex is tight enough without
+  // needing a path-prefix check.
+  if (!isValidSid(sid)) return c.json({ error: "invalid sid" }, 400);
+  const session = manager.get(sid);
+  if (session) return eventsForSession(session, c);
+  // Fall through to on-disk JSONL for sessions that aren't loaded in
+  // memory (e.g. after a server restart). Matches the snapshot view an
+  // archived session gets from /sessions?include=archived: fully-formed
+  // transcript, no live updates.
+  const sinceRaw = c.req.query("since");
+  const since = sinceRaw !== undefined ? Number(sinceRaw) : -1;
+  if (!Number.isFinite(since)) {
+    return c.json({ error: "invalid since" }, 400);
+  }
+  const jsonlPath = join(sessionsDir, `${sid}.jsonl`);
+  const contents = await readJsonlOrEmpty(jsonlPath);
+  if (!contents) return c.json({ error: "unknown session" }, 404);
+  return c.json({
+    session_id: sid,
+    events: parseEventsSince(contents, since),
+  });
 });
 
 app.post("/:sid/input", async (c) => {
@@ -535,7 +600,82 @@ app.post("/:sid/approval", async (c) => {
 
 // ---- sessions CRUD ----
 
-app.get("/sessions", (c) => c.json({ sessions: manager.listSnapshots() }));
+app.get("/sessions", async (c) => {
+  const inMemory = manager.listSnapshots();
+  const include = c.req.query("include");
+  if (include !== "archived") return c.json({ sessions: inMemory });
+  // Scan data/sessions/*.jsonl for sessions from prior runs. Ordered newest
+  // first by lastActivityTs so the PWA can render without a second sort.
+  const archived = await manager.listArchivedSnapshots();
+  const merged = [...inMemory, ...archived].sort((a, b) => {
+    if (a.lastActivityTs === b.lastActivityTs) return 0;
+    return a.lastActivityTs < b.lastActivityTs ? 1 : -1;
+  });
+  return c.json({ sessions: merged });
+});
+
+// ---- /inbox (always-on delta stream) ----
+//
+// Snapshot-on-connect then named-event deltas. No replay log: if a client
+// drops and reconnects, the fresh snapshot is authoritative — deltas in
+// between are presumed lost, which is fine since the snapshot carries every
+// field the deltas mutate.
+
+app.get("/inbox", (c) => {
+  return streamSSE(c, async (stream) => {
+    const signal = c.req.raw.signal;
+    // Per-connection buffer of deltas pending writeSSE. Unbounded by
+    // design for v0: each delta is ~100 bytes, sessions move slowly, and
+    // snapshot-on-reconnect makes drop-on-overflow safe if we ever need
+    // to cap it. If a backgrounded client on a busy server ever shows up
+    // as a memory regression, swap this for a ring buffer + forced close
+    // on overflow — the reconnect will pull a fresh snapshot.
+    const queue: import("./session-manager").InboxDelta[] = [];
+    let notify: (() => void) | null = null;
+    const unsub = manager.subscribeInbox((delta) => {
+      queue.push(delta);
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
+    });
+    const onAbort = () => {
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    const heartbeat = setInterval(() => {
+      stream.write(": ping\n\n").catch(() => {});
+    }, 15000);
+    try {
+      await stream.writeSSE({
+        event: "snapshot",
+        data: JSON.stringify({ sessions: manager.listSnapshots() }),
+      });
+      while (!signal.aborted) {
+        if (queue.length === 0) {
+          await new Promise<void>((r) => {
+            notify = r;
+          });
+          continue;
+        }
+        const delta = queue.shift()!;
+        await stream.writeSSE({
+          event: "delta",
+          data: JSON.stringify(delta),
+        });
+      }
+    } finally {
+      clearInterval(heartbeat);
+      signal.removeEventListener("abort", onAbort);
+      unsub();
+    }
+  });
+});
 
 app.post("/sessions", async (c) => {
   // PR 1 doesn't expose a per-session workdir knob — every new session

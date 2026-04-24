@@ -28,6 +28,10 @@ export interface SessionCallbacks {
   onCcSidObserved?: (session: Session, ccSid: string) => void;
   onEnded?: (session: Session) => void;
   onEmit?: (session: Session, evt: EnvelopeEvent) => void;
+  onStatusChanged?: (session: Session, status: SessionStatus) => void;
+  onPendingCountChanged?: (session: Session, count: number) => void;
+  onLastActivityChanged?: (session: Session, ts: string) => void;
+  onYoloChanged?: (session: Session, yoloMode: boolean) => void;
 }
 
 export interface SessionOpts {
@@ -104,6 +108,9 @@ export class Session {
   // wiring the pumps + exitPromise) can wait for wiring to complete
   // instead of racing finalize() against still-running spawn code.
   private _spawnPromise: Promise<void> | null = null;
+  // Aborts when finalize() runs so long-lived consumers (SSE streams,
+  // subscribers) can exit their loops instead of hanging on a dead session.
+  private readonly endedController = new AbortController();
 
   constructor(opts: SessionOpts) {
     this.oakridgeSid = opts.oakridgeSid;
@@ -123,6 +130,24 @@ export class Session {
 
   get currentCcSid(): string | null {
     return this.ccSid;
+  }
+
+  get endedSignal(): AbortSignal {
+    return this.endedController.signal;
+  }
+
+  private setStatus(status: SessionStatus): void {
+    if (this._status === status) return;
+    this._status = status;
+    try {
+      this.callbacks.onStatusChanged?.(this, status);
+    } catch (e) {
+      console.error(
+        `cc-deck: onStatusChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
   }
 
   snapshot(): SessionSnapshot {
@@ -163,6 +188,15 @@ export class Session {
       payload,
     };
     this.lastActivityTs = evt.ts;
+    try {
+      this.callbacks.onLastActivityChanged?.(this, evt.ts);
+    } catch (e) {
+      console.error(
+        `cc-deck: onLastActivityChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
     const task = async () => {
       this.jsonlWriter.write(JSON.stringify(evt) + "\n");
       await this.jsonlWriter.flush();
@@ -231,7 +265,7 @@ export class Session {
       throw err;
     }
 
-    this._status = "live";
+    this.setStatus("live");
 
     const activeProc = this.proc;
     const procStdout = activeProc.stdout as ReadableStream<Uint8Array>;
@@ -332,12 +366,60 @@ export class Session {
     // Idempotent: abort() and the exitPromise's finally can both race into
     // finalize; the first one wins and the second is a no-op.
     if (this._status === "ended") return;
+    // Write terminal permission_resolved frames for every still-parked
+    // approval BEFORE flipping status. Once setStatus("ended") runs, emit()
+    // short-circuits, so if we resolved the pending promises first the
+    // /hook/approval handler would race to emit its own
+    // permission_resolved and hit the short-circuit — leaving the JSONL
+    // with a permission_request that has no terminal resolution. Emitting
+    // here (status still "live", writer still open) keeps the transcript
+    // closed over every request.
+    //
+    // The .delete() below happens synchronously BEFORE the await, which
+    // claims ownership of the request_id atomically. If a concurrent
+    // /:sid/approval handler is resolving the same request, its
+    // deleteApproval() either already ran (we see .get() === undefined
+    // and skip) or races and finds nothing — either way only one
+    // permission_resolved entry makes it to the JSONL.
+    const parkedRequestIds = [...this.pendingApprovals.keys()];
+    let resolvedCount = 0;
+    for (const requestId of parkedRequestIds) {
+      const pending = this.pendingApprovals.get(requestId);
+      if (!pending) continue;
+      this.pendingApprovals.delete(requestId);
+      try {
+        await this.emit("permission_resolved", {
+          request_id: requestId,
+          decision: "deny",
+          reason: "session_ended",
+        });
+      } catch (err) {
+        console.error(
+          `cc-deck: failed to emit terminal permission_resolved for ${requestId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      try {
+        pending.resolve("deny");
+      } catch {
+        // ignore
+      }
+      resolvedCount++;
+    }
     // Flip status BEFORE draining so any emit() racing with finalize sees
     // the ended flag and short-circuits instead of queueing new writes
     // onto a writer we're about to close.
-    this._status = "ended";
-    // Reject any still-parked approvals so the gate's curl calls don't hang
-    // indefinitely on a dead subprocess.
+    this.setStatus("ended");
+    // Unblock long-lived consumers (SSE streams, subscribers) waiting on
+    // events from this session. Done before resolving pending approvals so
+    // stream loops see the aborted signal promptly.
+    this.endedController.abort();
+    // Sweep anything that slipped in during the emit loop (a /hook/approval
+    // that racked between our status check and the final clear). These are
+    // resolved without a JSONL entry since status is now ended; the
+    // handler's own emit will short-circuit as before.
+    const hadStragglers = this.pendingApprovals.size > 0;
     for (const [, pending] of this.pendingApprovals) {
       try {
         pending.resolve("deny");
@@ -346,6 +428,7 @@ export class Session {
       }
     }
     this.pendingApprovals.clear();
+    if (resolvedCount > 0 || hadStragglers) this.firePendingCountChanged();
     // Drain in-flight emit work (write+flush+fanout) before closing the
     // writer — otherwise queued tasks that were accepted before the status
     // flip would hit an ended writer.
@@ -398,12 +481,28 @@ export class Session {
 
   registerApproval(requestId: string, pending: PendingApproval): void {
     this.pendingApprovals.set(requestId, pending);
+    this.firePendingCountChanged();
   }
 
   deleteApproval(requestId: string): PendingApproval | undefined {
     const p = this.pendingApprovals.get(requestId);
-    if (p) this.pendingApprovals.delete(requestId);
+    if (p) {
+      this.pendingApprovals.delete(requestId);
+      this.firePendingCountChanged();
+    }
     return p;
+  }
+
+  private firePendingCountChanged(): void {
+    try {
+      this.callbacks.onPendingCountChanged?.(this, this.pendingApprovals.size);
+    } catch (e) {
+      console.error(
+        `cc-deck: onPendingCountChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
   }
 
   getApproval(requestId: string): PendingApproval | undefined {
@@ -431,6 +530,15 @@ export class Session {
     if (this.yoloMode === enabled) return this.yoloMode;
     await this.emit("yolo_mode_changed", { enabled });
     this.yoloMode = enabled;
+    try {
+      this.callbacks.onYoloChanged?.(this, this.yoloMode);
+    } catch (e) {
+      console.error(
+        `cc-deck: onYoloChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
     if (this.yoloMode) this.drainParkedFor(() => true);
     return this.yoloMode;
   }
@@ -448,11 +556,14 @@ export class Session {
   }
 
   drainParkedFor(predicate: (a: PendingApproval) => boolean): void {
+    let drained = false;
     for (const [requestId, pending] of this.pendingApprovals) {
       if (!predicate(pending)) continue;
       this.pendingApprovals.delete(requestId);
       pending.resolve("allow");
+      drained = true;
     }
+    if (drained) this.firePendingCountChanged();
   }
 
   async abort(): Promise<number> {
