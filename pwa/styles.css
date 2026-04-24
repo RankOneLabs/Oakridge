@@ -64,6 +64,46 @@ body {
   color: #888;
 }
 
+.yolo-toggle {
+  background: #1a1a1a;
+  color: #888;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 0.25rem 0.75rem;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  /* 44px to meet touch-target guidance — this is the most security-relevant
+     control in the top bar, so reliable tap matters more than blending in
+     with the smaller status pill / event count text next to it. */
+  min-height: 44px;
+}
+
+.yolo-error {
+  color: #e67070;
+  font-size: 0.75rem;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.yolo-toggle:hover:not(:disabled) {
+  border-color: #3a3a3a;
+  color: #ccc;
+}
+.yolo-toggle.is-on {
+  background: #3a2a0a;
+  color: #f5b050;
+  border-color: #6a4a18;
+  box-shadow: 0 0 8px rgba(245, 176, 80, 0.3);
+}
+.yolo-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .session-id {
   /* Shown only at desktop widths — below that, screen real estate is at a
      premium and the id isn't operator-actionable info. */
@@ -84,6 +124,7 @@ body {
 /* Consistent keyboard focus indicator across interactive elements. */
 .input-bar button:focus-visible,
 .card-permission-buttons button:focus-visible,
+.yolo-toggle:focus-visible,
 .card summary:focus-visible,
 .row-thinking summary:focus-visible {
   outline: 2px solid #2563eb;
@@ -289,6 +330,10 @@ body {
 .btn-deny {
   background: #3a2020;
   color: #e67070;
+}
+.btn-always {
+  background: #3a2a0a;
+  color: #f5b050;
 }
 .btn-approve {
   background: #2563eb;
