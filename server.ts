@@ -268,8 +268,23 @@ app.post("/input", async (c) => {
 type Decision = "allow" | "deny";
 interface PendingApproval {
   resolve: (d: Decision) => void;
+  toolName: string;
 }
 const pendingApprovals = new Map<string, PendingApproval>();
+
+// Session-scoped auto-approve state. Both reset when the server restarts.
+// Persisted indirectly via the JSONL event log — yolo_mode_changed and
+// tool_allowlisted events let reconnecting clients rebuild the same state.
+let yoloMode = false;
+const allowedTools = new Set<string>();
+
+function drainParkedFor(predicate: (a: PendingApproval) => boolean): void {
+  for (const [requestId, pending] of pendingApprovals) {
+    if (!predicate(pending)) continue;
+    pendingApprovals.delete(requestId);
+    pending.resolve("allow");
+  }
+}
 
 interface HookInput {
   session_id: string;
@@ -297,6 +312,33 @@ app.post("/hook/approval", async (c) => {
     return c.json({ error: `unexpected hook_event_name: ${hook.hook_event_name}` }, 400);
   }
 
+  // Auto-approve: yolo mode short-circuits everything; per-tool allowlist
+  // short-circuits matching tools. Emit a notice so the operator can still
+  // see what ran without prompting them.
+  const autoReason = yoloMode
+    ? "yolo"
+    : allowedTools.has(hook.tool_name)
+      ? "allowlist"
+      : null;
+  if (autoReason) {
+    await emit("permission_auto_approved", {
+      tool_name: hook.tool_name,
+      tool_input: hook.tool_input,
+      tool_use_id: hook.tool_use_id,
+      reason: autoReason,
+    });
+    return c.json({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason:
+          autoReason === "yolo"
+            ? "auto-approved (yolo mode)"
+            : `auto-approved (always allow ${hook.tool_name})`,
+      },
+    });
+  }
+
   const requestId = randomUUID();
   const signal = c.req.raw.signal;
 
@@ -308,7 +350,10 @@ app.post("/hook/approval", async (c) => {
     resolveDecision = res;
     rejectDecision = rej;
   });
-  pendingApprovals.set(requestId, { resolve: resolveDecision! });
+  pendingApprovals.set(requestId, {
+    resolve: resolveDecision!,
+    toolName: hook.tool_name,
+  });
   // If the gate's curl is aborted (CC killed, --max-time expired, server
   // shutting down), reject so we don't leak the map entry forever.
   signal.addEventListener(
@@ -370,9 +415,13 @@ app.post("/hook/approval", async (c) => {
 });
 
 app.post("/approval", async (c) => {
-  let body: { request_id?: unknown; decision?: unknown };
+  let body: { request_id?: unknown; decision?: unknown; scope?: unknown };
   try {
-    body = (await c.req.json()) as { request_id?: unknown; decision?: unknown };
+    body = (await c.req.json()) as {
+      request_id?: unknown;
+      decision?: unknown;
+      scope?: unknown;
+    };
   } catch {
     return c.json({ error: "invalid json" }, 400);
   }
@@ -382,13 +431,46 @@ app.post("/approval", async (c) => {
   if (body.decision !== "approve" && body.decision !== "deny") {
     return c.json({ error: "decision must be 'approve' or 'deny'" }, 400);
   }
+  if (body.scope !== undefined && body.scope !== "once" && body.scope !== "always") {
+    return c.json({ error: "scope must be 'once' or 'always'" }, 400);
+  }
   const pending = pendingApprovals.get(body.request_id);
   if (!pending) {
     return c.json({ error: "unknown or already-resolved request_id" }, 404);
   }
   pendingApprovals.delete(body.request_id);
   pending.resolve(body.decision === "approve" ? "allow" : "deny");
+
+  // "Always" only applies to approves — denying never adds to the allowlist.
+  if (body.scope === "always" && body.decision === "approve") {
+    if (!allowedTools.has(pending.toolName)) {
+      allowedTools.add(pending.toolName);
+      await emit("tool_allowlisted", { tool_name: pending.toolName });
+    }
+    // Drain any other parked requests for the same tool so the operator
+    // doesn't have to tap through them individually.
+    drainParkedFor((p) => p.toolName === pending.toolName);
+  }
   return c.json({ ok: true });
+});
+
+app.post("/yolo", async (c) => {
+  let body: { enabled?: unknown };
+  try {
+    body = (await c.req.json()) as { enabled?: unknown };
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (typeof body.enabled !== "boolean") {
+    return c.json({ error: "enabled must be a boolean" }, 400);
+  }
+  if (yoloMode !== body.enabled) {
+    yoloMode = body.enabled;
+    await emit("yolo_mode_changed", { enabled: yoloMode });
+  }
+  // Enabling yolo also drains everything currently parked.
+  if (yoloMode) drainParkedFor(() => true);
+  return c.json({ ok: true, enabled: yoloMode });
 });
 
 // === static PWA (built into pwa/dist/ via `bun run build:pwa`) ===

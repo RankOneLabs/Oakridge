@@ -65,4 +65,5 @@ Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation
 - **Hook endpoint:** `/hook/approval` is filtered to `127.0.0.1` at the route handler — only the in-process gate script can park approval requests, not a tailnet peer.
 - **Markdown:** assistant text is rendered with `react-markdown` + `rehype-sanitize`; no `dangerouslySetInnerHTML`, so prompt-injected HTML from web-fetched content can't execute.
 - **CC user settings:** the server spawns CC with `--setting-sources ''` so user-level allowlists don't bypass the approval gate.
+- **YOLO mode and per-tool always-allow** are operator-controlled escape hatches. YOLO mode (top-bar toggle) auto-approves every PreToolUse for the rest of the session — useful for setting CC loose on a long task without tapping each prompt. The "Always {tool}" button on a permission card adds that tool name to a session-scoped allowlist; matching future calls auto-approve. Both reset on server restart, are emitted as visible events, and turn the gate into "see what happened" rather than "decide each call." Use them deliberately.
 

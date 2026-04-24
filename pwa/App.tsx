@@ -21,6 +21,11 @@ export function App() {
     () => new Map(),
   );
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // Auto-approve state, replayed from the server's event log on connect.
+  const [yoloMode, setYoloMode] = useState(false);
+  const [allowedTools, setAllowedTools] = useState<Set<string>>(
+    () => new Set(),
+  );
   const seenIds = useRef<Set<number>>(new Set());
   const endRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -61,6 +66,22 @@ export function App() {
             setSessionId(p.sessionId);
           }
         }
+        if (evt.type === "yolo_mode_changed") {
+          const p = evt.payload as { enabled?: unknown };
+          if (typeof p.enabled === "boolean") setYoloMode(p.enabled);
+        }
+        if (evt.type === "tool_allowlisted") {
+          const p = evt.payload as { tool_name?: unknown };
+          if (typeof p.tool_name === "string") {
+            const name = p.tool_name;
+            setAllowedTools((prev) => {
+              if (prev.has(name)) return prev;
+              const next = new Set(prev);
+              next.add(name);
+              return next;
+            });
+          }
+        }
       } catch {
         // malformed frame; ignore
       }
@@ -74,8 +95,13 @@ export function App() {
         status={status}
         eventCount={events.length}
         sessionId={sessionId}
+        yoloMode={yoloMode}
       />
-      <EventList events={events} resolutions={resolutions} />
+      <EventList
+        events={events}
+        resolutions={resolutions}
+        allowedTools={allowedTools}
+      />
       <InputBox />
       {/* Scroll sentinel lives after InputBox so auto-scroll keeps the input
           visible on desktop (where the input is inline, not fixed). On mobile
@@ -90,15 +116,49 @@ function TopBar({
   status,
   eventCount,
   sessionId,
+  yoloMode,
 }: {
   status: Status;
   eventCount: number;
   sessionId: string | null;
+  yoloMode: boolean;
 }) {
+  const [pending, setPending] = useState(false);
+  async function toggleYolo() {
+    if (pending) return;
+    setPending(true);
+    try {
+      await fetch("/yolo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: !yoloMode }),
+      });
+      // Don't optimistically flip — wait for the yolo_mode_changed event so
+      // every connected client sees the same state at the same time.
+    } catch {
+      // Surface failure quietly; the toggle just won't flip.
+    } finally {
+      setPending(false);
+    }
+  }
   return (
     <header className="top-bar">
       <span className={`status status-${status}`}>{status}</span>
       <span className="event-count">{eventCount} events</span>
+      <button
+        type="button"
+        className={`yolo-toggle ${yoloMode ? "is-on" : ""}`}
+        onClick={() => void toggleYolo()}
+        disabled={pending}
+        title={
+          yoloMode
+            ? "YOLO mode on — every tool call auto-approves"
+            : "Tap to enable YOLO mode (auto-approve every tool call)"
+        }
+        aria-pressed={yoloMode}
+      >
+        {yoloMode ? "YOLO ON" : "YOLO"}
+      </button>
       {sessionId && (
         <span
           className="session-id"
@@ -115,14 +175,21 @@ function TopBar({
 function EventList({
   events,
   resolutions,
+  allowedTools,
 }: {
   events: EnvelopeEvent[];
   resolutions: ResolutionMap;
+  allowedTools: Set<string>;
 }) {
   return (
     <div className="events">
       {events.map((e) => (
-        <EventRow key={e.id} event={e} resolutions={resolutions} />
+        <EventRow
+          key={e.id}
+          event={e}
+          resolutions={resolutions}
+          allowedTools={allowedTools}
+        />
       ))}
     </div>
   );
@@ -131,9 +198,11 @@ function EventList({
 function EventRow({
   event,
   resolutions,
+  allowedTools,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
+  allowedTools: Set<string>;
 }) {
   switch (event.type) {
     case "user":
@@ -141,10 +210,17 @@ function EventRow({
     case "assistant":
       return <AssistantRow event={event} />;
     case "permission_request":
-      return <PermissionRow event={event} resolutions={resolutions} />;
+      return (
+        <PermissionRow event={event} resolutions={resolutions} allowedTools={allowedTools} />
+      );
     case "permission_resolved":
       // folded into the matching permission_request card
       return null;
+    case "permission_auto_approved":
+      return <AutoApprovedNotice event={event} />;
+    case "yolo_mode_changed":
+    case "tool_allowlisted":
+      return <SystemNotice event={event} />;
     case "system":
     case "session_started":
     case "subprocess_exited":
@@ -304,9 +380,11 @@ interface PermissionRequestPayload {
 function PermissionRow({
   event,
   resolutions,
+  allowedTools,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
+  allowedTools: Set<string>;
 }) {
   const p = event.payload as PermissionRequestPayload;
   const resolution = resolutions.get(p.request_id);
@@ -323,7 +401,10 @@ function PermissionRow({
     );
   }
 
-  async function decide(decision: "approve" | "deny") {
+  async function decide(
+    decision: "approve" | "deny",
+    scope: "once" | "always" = "once",
+  ) {
     if (localPending) return;
     setLocalPending(true);
     setLocalError(null);
@@ -331,7 +412,11 @@ function PermissionRow({
       const res = await fetch("/approval", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ request_id: p.request_id, decision }),
+        body: JSON.stringify({
+          request_id: p.request_id,
+          decision,
+          scope,
+        }),
       });
       if (!res.ok) {
         setLocalError(`server returned ${res.status}`);
@@ -344,6 +429,11 @@ function PermissionRow({
   }
 
   const inputPreview = JSON.stringify(p.tool_input, null, 2);
+  // If the tool is already on the session allowlist, hide the redundant
+  // "always allow" button — server would have auto-approved this request
+  // had it arrived after the allowlist entry, so a stale parked card might
+  // still show it; one tap suffices.
+  const showAlways = !allowedTools.has(p.tool_name);
 
   return (
     <div className="card card-permission">
@@ -359,6 +449,17 @@ function PermissionRow({
         >
           Deny
         </button>
+        {showAlways && (
+          <button
+            type="button"
+            className="btn-always"
+            disabled={localPending}
+            onClick={() => void decide("approve", "always")}
+            title={`Approve and auto-allow all future ${p.tool_name} calls this session`}
+          >
+            Always {p.tool_name}
+          </button>
+        )}
         <button
           type="button"
           className="btn-approve"
@@ -367,6 +468,22 @@ function PermissionRow({
         >
           Approve
         </button>
+      </div>
+    </div>
+  );
+}
+
+function AutoApprovedNotice({ event }: { event: EnvelopeEvent }) {
+  const p = (event.payload ?? {}) as {
+    tool_name?: unknown;
+    reason?: unknown;
+  };
+  const tool = typeof p.tool_name === "string" ? p.tool_name : "tool";
+  const reason = p.reason === "yolo" ? "yolo" : "always allow";
+  return (
+    <div className="row row-system">
+      <div className="notice notice-allow">
+        auto-approved · {tool} <span className="notice-tag">({reason})</span>
       </div>
     </div>
   );
@@ -387,6 +504,12 @@ function SystemNotice({ event }: { event: EnvelopeEvent }) {
       break;
     case "rate_limit_event":
       text = "rate limit event";
+      break;
+    case "yolo_mode_changed":
+      text = `yolo mode ${p.enabled ? "enabled" : "disabled"}`;
+      break;
+    case "tool_allowlisted":
+      text = `always allow: ${String(p.tool_name ?? "?")}`;
       break;
     case "system": {
       const raw = event.payload as { subtype?: string } | null;
