@@ -61,7 +61,7 @@ Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation
 
 ## Security posture
 
-- **Network:** binds to `127.0.0.1` by default. Operator opts into wider exposure with `--host=0.0.0.0` for tailnet/phone access, and is responsible for ensuring only trusted peers can reach the port (Tailscale-only, LAN firewall, etc.). Control endpoints (`/input`, `/approval`, `/stream`, `/events`) are unauthenticated in v0 — token-based auth is planned follow-up work.
+- **Network:** binds to `127.0.0.1` by default. Operator opts into wider exposure with `--host=0.0.0.0` for tailnet/phone access, and is responsible for ensuring only trusted peers can reach the port (Tailscale-only, LAN firewall, etc.). Control endpoints (`/input`, `/approval`, `/stream`, `/events`, `/yolo`) are unauthenticated in v0 — token-based auth is planned follow-up work.
 - **Hook endpoint:** `/hook/approval` is filtered to `127.0.0.1` at the route handler — only the in-process gate script can park approval requests, not a tailnet peer.
 - **Markdown:** assistant text is rendered with `react-markdown` + `rehype-sanitize`; no `dangerouslySetInnerHTML`, so prompt-injected HTML from web-fetched content can't execute.
 - **CC user settings:** the server spawns CC with `--setting-sources ''` so user-level allowlists don't bypass the approval gate.

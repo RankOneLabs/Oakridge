@@ -63,7 +63,20 @@ export function App() {
           // Latest session_started wins — after a reconnect, the server's
           // current session id replaces any stale one from catchup.
           if (typeof p.sessionId === "string") {
-            setSessionId(p.sessionId);
+            const nextSessionId = p.sessionId;
+            setSessionId((prev) => {
+              // If the session actually changed (e.g. server restarted
+              // mid-EventSource-reconnect), clear session-scoped auto-
+              // approve state so the prior session's yolo/allowlist
+              // doesn't leak into the new one. Subsequent yolo_mode_changed
+              // and tool_allowlisted events for the new session will
+              // re-establish state if needed.
+              if (prev !== null && prev !== nextSessionId) {
+                setYoloMode(false);
+                setAllowedTools(new Set());
+              }
+              return nextSessionId;
+            });
           }
         }
         if (evt.type === "yolo_mode_changed") {
@@ -419,7 +432,17 @@ function PermissionRow({
         }),
       });
       if (!res.ok) {
-        setLocalError(`server returned ${res.status}`);
+        // Mirror InputBox: surface the server's JSON `error` field if
+        // present so the operator sees `scope must be...` etc instead of
+        // a bare status code.
+        const body = (await res.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        setLocalError(
+          typeof body?.error === "string"
+            ? body.error
+            : `server returned ${res.status}`,
+        );
       }
     } catch (err) {
       setLocalError(err instanceof Error ? err.message : "request failed");

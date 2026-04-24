@@ -112,6 +112,7 @@ body {
 /* Consistent keyboard focus indicator across interactive elements. */
 .input-bar button:focus-visible,
 .card-permission-buttons button:focus-visible,
+.yolo-toggle:focus-visible,
 .card summary:focus-visible,
 .row-thinking summary:focus-visible {
   outline: 2px solid #2563eb;

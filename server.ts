@@ -444,8 +444,12 @@ app.post("/approval", async (c) => {
   // "Always" only applies to approves — denying never adds to the allowlist.
   if (body.scope === "always" && body.decision === "approve") {
     if (!allowedTools.has(pending.toolName)) {
-      allowedTools.add(pending.toolName);
+      // Emit before mutating so server state never diverges from what a
+      // reconnecting client can rebuild via JSONL replay. If emit throws
+      // (disk full, perm error), the allowlist stays unchanged and the
+      // error surfaces to the caller.
       await emit("tool_allowlisted", { tool_name: pending.toolName });
+      allowedTools.add(pending.toolName);
     }
     // Drain any other parked requests for the same tool so the operator
     // doesn't have to tap through them individually.
@@ -465,8 +469,12 @@ app.post("/yolo", async (c) => {
     return c.json({ error: "enabled must be a boolean" }, 400);
   }
   if (yoloMode !== body.enabled) {
+    // Emit before mutating so server state never diverges from what a
+    // reconnecting client can rebuild via JSONL replay. If emit throws
+    // we abort before flipping yoloMode, so a partial-success leak (yolo
+    // on but no record + no drain) can't happen.
+    await emit("yolo_mode_changed", { enabled: body.enabled });
     yoloMode = body.enabled;
-    await emit("yolo_mode_changed", { enabled: yoloMode });
   }
   // Enabling yolo also drains everything currently parked.
   if (yoloMode) drainParkedFor(() => true);
