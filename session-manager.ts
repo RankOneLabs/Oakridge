@@ -313,13 +313,28 @@ export class SessionManager {
  * Reconstructs a SessionSnapshot from an on-disk JSONL. Used by archived
  * scans and (via the caller) /:sid/events fall-through for sessions that
  * aren't in memory — e.g. after a server restart. Returns null if the file
- * is empty or unreadable, since an empty jsonl can't yield a useful row.
+ * is empty, missing, or unreadable, since an empty jsonl can't yield a
+ * useful row and a single unreadable jsonl shouldn't fail the whole
+ * archived-list response.
  */
 async function loadArchivedSnapshot(
   sid: string,
   jsonlPath: string,
 ): Promise<SessionSnapshot | null> {
-  const contents = await readJsonlOrEmpty(jsonlPath);
+  let contents: string;
+  try {
+    contents = await readJsonlOrEmpty(jsonlPath);
+  } catch (err) {
+    // readJsonlOrEmpty swallows ENOENT but rethrows everything else (e.g.
+    // EACCES, EISDIR, I/O errors). Skip the entry rather than 500 the
+    // caller — the admin can chase it in logs.
+    console.error(
+      `cc-deck: failed to read archived jsonl ${jsonlPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
   if (!contents) return null;
   let createdAt: string | null = null;
   let workdir = "";

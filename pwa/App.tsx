@@ -1,4 +1,11 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Markdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 
@@ -101,6 +108,14 @@ interface InboxState {
    */
   inMemorySids: Set<string>;
   inboxStatus: Status;
+  /**
+   * Fold a snapshot we already have in hand (e.g. the response body of
+   * POST /sessions) into the inbox state so the destination view mounts
+   * with the correct snapshot instead of racing the /inbox delta. Safe
+   * to call before /inbox actually delivers session_created — the delta
+   * just re-seats the same entry.
+   */
+  hydrateSession: (snapshot: SessionSnapshot) => void;
 }
 
 function useInbox(): InboxState {
@@ -111,6 +126,20 @@ function useInbox(): InboxState {
     () => new Set(),
   );
   const [inboxStatus, setInboxStatus] = useState<Status>("connecting");
+
+  const hydrateSession = useCallback((snapshot: SessionSnapshot) => {
+    setSessions((prev) => {
+      const next = new Map(prev);
+      next.set(snapshot.sid, snapshot);
+      return next;
+    });
+    setInMemorySids((prev) => {
+      if (prev.has(snapshot.sid)) return prev;
+      const next = new Set(prev);
+      next.add(snapshot.sid);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -126,6 +155,18 @@ function useInbox(): InboxState {
           const next = new Map(prev);
           for (const s of data.sessions) {
             if (!next.has(s.sid)) next.set(s.sid, s);
+          }
+          return next;
+        });
+        // Seed inMemorySids with every non-ended sid so SessionView picks
+        // /:sid/stream (SSE) over one-shot /:sid/events when the user
+        // clicks a live session before the /inbox SSE has connected. Only
+        // non-ended sids: archived-on-disk entries (always status=ended)
+        // would otherwise be incorrectly marked as in-memory.
+        setInMemorySids((prev) => {
+          const next = new Set(prev);
+          for (const s of data.sessions) {
+            if (s.status !== "ended") next.add(s.sid);
           }
           return next;
         });
@@ -171,7 +212,7 @@ function useInbox(): InboxState {
     };
   }, []);
 
-  return { sessions, inMemorySids, inboxStatus };
+  return { sessions, inMemorySids, inboxStatus, hydrateSession };
 }
 
 function applyDelta(
@@ -215,7 +256,7 @@ function applyDelta(
 export function App() {
   const [sid, navigate] = useHashSid();
   const [theme, toggleTheme] = useTheme();
-  const { sessions, inMemorySids, inboxStatus } = useInbox();
+  const { sessions, inMemorySids, inboxStatus, hydrateSession } = useInbox();
 
   if (sid === null) {
     return (
@@ -225,6 +266,7 @@ export function App() {
         theme={theme}
         onToggleTheme={toggleTheme}
         onSelect={(nextSid) => navigate(nextSid)}
+        onHydrateSession={hydrateSession}
       />
     );
   }
@@ -249,12 +291,14 @@ function SessionListView({
   theme,
   onToggleTheme,
   onSelect,
+  onHydrateSession,
 }: {
   sessions: Map<string, SessionSnapshot>;
   inboxStatus: Status;
   theme: Theme;
   onToggleTheme: () => void;
   onSelect: (sid: string) => void;
+  onHydrateSession: (snapshot: SessionSnapshot) => void;
 }) {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -278,6 +322,11 @@ function SessionListView({
         return;
       }
       const snap = (await res.json()) as SessionSnapshot;
+      // Hydrate before navigating so SessionView mounts with the snapshot
+      // present and inMemory=true, rather than racing the /inbox
+      // session_created delta. Without this the input box is hidden and
+      // the stream falls back to one-shot /events for the first ~100ms.
+      onHydrateSession(snap);
       onSelect(snap.sid);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "network error");
@@ -406,11 +455,14 @@ function formatRelative(iso: string): string {
   const deltaSec = Math.max(0, Math.round((Date.now() - then) / 1000));
   if (deltaSec < 5) return "just now";
   if (deltaSec < 60) return `${deltaSec}s ago`;
-  const mins = Math.round(deltaSec / 60);
+  // Floor rather than round for the larger unit conversions — a 1m30s-old
+  // session showing as "2m ago" overstates the elapsed time. Labels
+  // advance only once the next threshold is actually crossed.
+  const mins = Math.floor(deltaSec / 60);
   if (mins < 60) return `${mins}m ago`;
-  const hours = Math.round(mins / 60);
+  const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
+  const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
 

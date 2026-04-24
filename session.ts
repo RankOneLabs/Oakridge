@@ -374,8 +374,19 @@ export class Session {
     // with a permission_request that has no terminal resolution. Emitting
     // here (status still "live", writer still open) keeps the transcript
     // closed over every request.
+    //
+    // The .delete() below happens synchronously BEFORE the await, which
+    // claims ownership of the request_id atomically. If a concurrent
+    // /:sid/approval handler is resolving the same request, its
+    // deleteApproval() either already ran (we see .get() === undefined
+    // and skip) or races and finds nothing — either way only one
+    // permission_resolved entry makes it to the JSONL.
     const parkedRequestIds = [...this.pendingApprovals.keys()];
+    let resolvedCount = 0;
     for (const requestId of parkedRequestIds) {
+      const pending = this.pendingApprovals.get(requestId);
+      if (!pending) continue;
+      this.pendingApprovals.delete(requestId);
       try {
         await this.emit("permission_resolved", {
           request_id: requestId,
@@ -389,6 +400,12 @@ export class Session {
           }`,
         );
       }
+      try {
+        pending.resolve("deny");
+      } catch {
+        // ignore
+      }
+      resolvedCount++;
     }
     // Flip status BEFORE draining so any emit() racing with finalize sees
     // the ended flag and short-circuits instead of queueing new writes
@@ -398,12 +415,11 @@ export class Session {
     // events from this session. Done before resolving pending approvals so
     // stream loops see the aborted signal promptly.
     this.endedController.abort();
-    // Reject any still-parked approvals so the gate's curl calls don't hang
-    // indefinitely on a dead subprocess. The /hook/approval handler will
-    // try to emit its own permission_resolved when the promise resolves —
-    // that emit hits the status-ended short-circuit, so there's no
-    // duplicate JSONL entry.
-    const hadPending = this.pendingApprovals.size > 0;
+    // Sweep anything that slipped in during the emit loop (a /hook/approval
+    // that racked between our status check and the final clear). These are
+    // resolved without a JSONL entry since status is now ended; the
+    // handler's own emit will short-circuit as before.
+    const hadStragglers = this.pendingApprovals.size > 0;
     for (const [, pending] of this.pendingApprovals) {
       try {
         pending.resolve("deny");
@@ -412,7 +428,7 @@ export class Session {
       }
     }
     this.pendingApprovals.clear();
-    if (hadPending) this.firePendingCountChanged();
+    if (resolvedCount > 0 || hadStragglers) this.firePendingCountChanged();
     // Drain in-flight emit work (write+flush+fanout) before closing the
     // writer — otherwise queued tasks that were accepted before the status
     // flip would hit an ended writer.
