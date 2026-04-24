@@ -11,7 +11,7 @@ A Bun + Hono server spawns `claude --print --input-format stream-json --output-f
 ```bash
 bun install
 bun run build:pwa
-bun run scripts/cc-start /path/to/your/repo
+./scripts/cc-start /path/to/your/repo
 ```
 
 Defaults to `127.0.0.1:8788` — open `http://localhost:8788/` in a browser on the same machine.
@@ -19,7 +19,7 @@ Defaults to `127.0.0.1:8788` — open `http://localhost:8788/` in a browser on t
 For phone/tablet access over Tailscale, bind all interfaces:
 
 ```bash
-bun run scripts/cc-start /path/to/your/repo --host=0.0.0.0
+./scripts/cc-start /path/to/your/repo --host=0.0.0.0
 ```
 
 Then open `http://<machine>:8788/` on your phone. Add to Home Screen for a full-screen standalone app. Only do this on networks where every reachable peer is trusted (Tailscale-only, or a LAN you control) — the control endpoints (`/input`, `/approval`, `/stream`, `/events`) are unauthenticated in v0.
@@ -28,7 +28,7 @@ Then open `http://<machine>:8788/` on your phone. Add to Home Screen for a full-
 
 ```bash
 # Terminal 1: server with the CC subprocess
-bun run scripts/cc-start /path/to/your/repo
+./scripts/cc-start /path/to/your/repo
 
 # Terminal 2: Vite dev server with HMR (proxies API calls to :8788)
 bun run dev:pwa
@@ -37,7 +37,7 @@ bun run dev:pwa
 
 ## Running
 
-The primary flow is just `bun run scripts/cc-start <workdir>` in a terminal. Ctrl-C to stop; CC dies with the server.
+The primary flow is just `./scripts/cc-start <workdir>` in a terminal. Ctrl-C to stop; CC dies with the server.
 
 ### Optional: cgroup limits via systemd-run
 
