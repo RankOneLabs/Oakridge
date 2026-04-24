@@ -147,8 +147,27 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 0.4rem;
   font-size: 0.85rem;
   z-index: 10;
+}
+
+.back-button {
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 0 0.6rem;
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  min-height: 44px;
+  min-width: 44px;
+}
+.back-button:hover {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
 }
 
 .status {
@@ -461,6 +480,167 @@ body {
 }
 .notice-deny {
   color: var(--danger-fg);
+}
+
+/* === session list === */
+
+.app-list {
+  padding-bottom: calc(env(safe-area-inset-bottom) + 1rem);
+}
+
+.session-list-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.75rem 0;
+}
+
+.btn-new-session {
+  background: var(--accent-blue);
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 0 1rem;
+  min-height: 44px;
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.btn-new-session:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.session-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.session-list-empty {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 2rem 0.5rem;
+  font-size: 0.9rem;
+}
+
+.session-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  width: 100%;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+  font: inherit;
+  font-family: inherit;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  min-height: 60px;
+}
+.session-row:hover {
+  border-color: var(--border-hover);
+}
+.session-row-ended {
+  opacity: 0.72;
+}
+
+.session-row-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+.session-row-status {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+}
+.session-row-status-live {
+  background: var(--status-connected-bg);
+  color: var(--status-connected-fg);
+}
+.session-row-status-starting {
+  background: var(--status-connecting-bg);
+  color: var(--status-connecting-fg);
+}
+.session-row-status-ended {
+  background: var(--bg-code);
+  color: var(--text-muted);
+}
+.session-row-sid {
+  font-family: "SF Mono", Menlo, monospace;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+.session-row-pending {
+  background: var(--permission-bg);
+  color: var(--permission-fg);
+  border: 1px solid var(--permission-border);
+  border-radius: 3px;
+  padding: 0.1rem 0.4rem;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-row-yolo {
+  background: var(--amber-bg);
+  color: var(--amber-fg);
+  border: 1px solid var(--amber-border);
+  border-radius: 3px;
+  padding: 0.1rem 0.4rem;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.session-row-activity {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 0.8rem;
+}
+.session-row-workdir {
+  color: var(--text-muted);
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-ended-banner {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.75rem;
+  padding-bottom: calc(env(safe-area-inset-bottom) + 0.75rem);
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  background: var(--bg-input-bar);
+  border-top: 1px solid var(--border-subtle);
+  z-index: 10;
+}
+@media (min-width: 1024px) {
+  .session-ended-banner {
+    position: static;
+    margin: 0.75rem 0 1rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    background: var(--bg-input-bar-desktop);
+  }
 }
 
 .input-bar {

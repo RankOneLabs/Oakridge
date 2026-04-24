@@ -28,6 +28,9 @@ export interface SessionCallbacks {
   onCcSidObserved?: (session: Session, ccSid: string) => void;
   onEnded?: (session: Session) => void;
   onEmit?: (session: Session, evt: EnvelopeEvent) => void;
+  onStatusChanged?: (session: Session, status: SessionStatus) => void;
+  onPendingCountChanged?: (session: Session, count: number) => void;
+  onLastActivityChanged?: (session: Session, ts: string) => void;
 }
 
 export interface SessionOpts {
@@ -104,6 +107,9 @@ export class Session {
   // wiring the pumps + exitPromise) can wait for wiring to complete
   // instead of racing finalize() against still-running spawn code.
   private _spawnPromise: Promise<void> | null = null;
+  // Aborts when finalize() runs so long-lived consumers (SSE streams,
+  // subscribers) can exit their loops instead of hanging on a dead session.
+  private readonly endedController = new AbortController();
 
   constructor(opts: SessionOpts) {
     this.oakridgeSid = opts.oakridgeSid;
@@ -123,6 +129,24 @@ export class Session {
 
   get currentCcSid(): string | null {
     return this.ccSid;
+  }
+
+  get endedSignal(): AbortSignal {
+    return this.endedController.signal;
+  }
+
+  private setStatus(status: SessionStatus): void {
+    if (this._status === status) return;
+    this._status = status;
+    try {
+      this.callbacks.onStatusChanged?.(this, status);
+    } catch (e) {
+      console.error(
+        `cc-deck: onStatusChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
   }
 
   snapshot(): SessionSnapshot {
@@ -163,6 +187,15 @@ export class Session {
       payload,
     };
     this.lastActivityTs = evt.ts;
+    try {
+      this.callbacks.onLastActivityChanged?.(this, evt.ts);
+    } catch (e) {
+      console.error(
+        `cc-deck: onLastActivityChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
     const task = async () => {
       this.jsonlWriter.write(JSON.stringify(evt) + "\n");
       await this.jsonlWriter.flush();
@@ -231,7 +264,7 @@ export class Session {
       throw err;
     }
 
-    this._status = "live";
+    this.setStatus("live");
 
     const activeProc = this.proc;
     const procStdout = activeProc.stdout as ReadableStream<Uint8Array>;
@@ -335,9 +368,14 @@ export class Session {
     // Flip status BEFORE draining so any emit() racing with finalize sees
     // the ended flag and short-circuits instead of queueing new writes
     // onto a writer we're about to close.
-    this._status = "ended";
+    this.setStatus("ended");
+    // Unblock long-lived consumers (SSE streams, subscribers) waiting on
+    // events from this session. Done before resolving pending approvals so
+    // stream loops see the aborted signal promptly.
+    this.endedController.abort();
     // Reject any still-parked approvals so the gate's curl calls don't hang
     // indefinitely on a dead subprocess.
+    const hadPending = this.pendingApprovals.size > 0;
     for (const [, pending] of this.pendingApprovals) {
       try {
         pending.resolve("deny");
@@ -346,6 +384,7 @@ export class Session {
       }
     }
     this.pendingApprovals.clear();
+    if (hadPending) this.firePendingCountChanged();
     // Drain in-flight emit work (write+flush+fanout) before closing the
     // writer — otherwise queued tasks that were accepted before the status
     // flip would hit an ended writer.
@@ -398,12 +437,28 @@ export class Session {
 
   registerApproval(requestId: string, pending: PendingApproval): void {
     this.pendingApprovals.set(requestId, pending);
+    this.firePendingCountChanged();
   }
 
   deleteApproval(requestId: string): PendingApproval | undefined {
     const p = this.pendingApprovals.get(requestId);
-    if (p) this.pendingApprovals.delete(requestId);
+    if (p) {
+      this.pendingApprovals.delete(requestId);
+      this.firePendingCountChanged();
+    }
     return p;
+  }
+
+  private firePendingCountChanged(): void {
+    try {
+      this.callbacks.onPendingCountChanged?.(this, this.pendingApprovals.size);
+    } catch (e) {
+      console.error(
+        `cc-deck: onPendingCountChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
   }
 
   getApproval(requestId: string): PendingApproval | undefined {
@@ -448,11 +503,14 @@ export class Session {
   }
 
   drainParkedFor(predicate: (a: PendingApproval) => boolean): void {
+    let drained = false;
     for (const [requestId, pending] of this.pendingApprovals) {
       if (!predicate(pending)) continue;
       this.pendingApprovals.delete(requestId);
       pending.resolve("allow");
+      drained = true;
     }
+    if (drained) this.firePendingCountChanged();
   }
 
   async abort(): Promise<number> {

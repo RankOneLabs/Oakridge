@@ -11,10 +11,21 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
+      // Top-level API routes used by the session list + inbox + CRUD.
+      "/sessions": { target: backendTarget, changeOrigin: true },
+      "/inbox": { target: backendTarget, changeOrigin: true },
+      // Per-sid routes. Keyed by regex so any sid prefix gets proxied.
+      // Must start with ^ for vite to treat the key as a RegExp.
+      "^/[^/]+/(stream|events|input|approval|yolo)(\\?.*)?$": {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      // Legacy single-session aliases kept for the PR 2.5 cutover window.
       "/stream": { target: backendTarget, changeOrigin: true },
       "/events": backendTarget,
       "/input": backendTarget,
       "/approval": backendTarget,
+      "/yolo": backendTarget,
     },
   },
   build: {
