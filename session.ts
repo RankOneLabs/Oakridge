@@ -244,7 +244,7 @@ export class Session {
       activeProc.kill();
     };
 
-    void (async () => {
+    const stdoutPump = (async () => {
       for await (const line of readLines(procStdout)) {
         if (!line.trim()) continue;
         try {
@@ -288,7 +288,7 @@ export class Session {
       }
     })().catch(fatalPumpError("stdout pump"));
 
-    void (async () => {
+    const stderrPump = (async () => {
       for await (const line of readLines(procStderr)) {
         await this.emit("subprocess_stderr", { line });
       }
@@ -296,6 +296,12 @@ export class Session {
 
     this.exitPromise = (async () => {
       const code = await activeProc.exited;
+      // Wait for both pumps to drain their buffers — activeProc.exited can
+      // resolve before readLines() has finished yielding the last of the
+      // stdout/stderr lines. Without this, finalize() would flip _status
+      // to "ended" and the trailing pump emits would short-circuit to
+      // the sentinel branch.
+      await Promise.allSettled([stdoutPump, stderrPump]);
       // finalize() must run even if the exit emit throws (disk full, perm
       // error), otherwise pending approvals stay parked and the jsonl
       // writer is never ended.
@@ -471,7 +477,11 @@ export class Session {
           return 1;
         }
       }
-      return 0;
+      // Ended without an exitPromise means _runSpawn() threw (Bun.spawn
+      // failed) before we wired the exit handler. That's a failure, not
+      // a clean exit — report non-zero so endAll()/DELETE aggregate it
+      // as an error.
+      return 1;
     }
     if (this.proc) {
       try {

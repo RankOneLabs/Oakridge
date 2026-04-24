@@ -237,6 +237,9 @@ async function inputForSession(session: Session, c: Context) {
 }
 
 async function yoloForSession(session: Session, c: Context) {
+  if (session.status !== "live") {
+    return c.json({ error: "session not live" }, 409);
+  }
   let body: { enabled?: unknown };
   try {
     body = (await c.req.json()) as { enabled?: unknown };
@@ -286,6 +289,9 @@ async function applyApproval(
   body: ApprovalBody,
   c: Context,
 ) {
+  if (session.status !== "live") {
+    return c.json({ error: "session not live" }, 409);
+  }
   const pending = session.deleteApproval(body.request_id);
   if (!pending) {
     return c.json({ error: "unknown or already-resolved request_id" }, 404);

@@ -120,9 +120,11 @@ export class SessionManager {
   }
 
   /**
-   * Aborts every live session and awaits each one's finalize path
-   * (jsonlWriter.end, subprocess_exited emit, ended callback). Returns the
-   * highest exit code across all sessions, or 0 if all exited cleanly.
+   * Aborts every session in the map (live, starting, or already ended —
+   * iterating all is intentional so a session mid-spawn is waited on, not
+   * skipped). Ended sessions short-circuit cheaply in Session.abort().
+   * Returns the highest exit code across all sessions, or 0 if all exited
+   * cleanly.
    */
   async endAll(): Promise<number> {
     const exits = await Promise.all(
