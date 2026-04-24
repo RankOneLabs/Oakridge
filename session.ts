@@ -31,6 +31,7 @@ export interface SessionCallbacks {
   onStatusChanged?: (session: Session, status: SessionStatus) => void;
   onPendingCountChanged?: (session: Session, count: number) => void;
   onLastActivityChanged?: (session: Session, ts: string) => void;
+  onYoloChanged?: (session: Session, yoloMode: boolean) => void;
 }
 
 export interface SessionOpts {
@@ -365,6 +366,30 @@ export class Session {
     // Idempotent: abort() and the exitPromise's finally can both race into
     // finalize; the first one wins and the second is a no-op.
     if (this._status === "ended") return;
+    // Write terminal permission_resolved frames for every still-parked
+    // approval BEFORE flipping status. Once setStatus("ended") runs, emit()
+    // short-circuits, so if we resolved the pending promises first the
+    // /hook/approval handler would race to emit its own
+    // permission_resolved and hit the short-circuit — leaving the JSONL
+    // with a permission_request that has no terminal resolution. Emitting
+    // here (status still "live", writer still open) keeps the transcript
+    // closed over every request.
+    const parkedRequestIds = [...this.pendingApprovals.keys()];
+    for (const requestId of parkedRequestIds) {
+      try {
+        await this.emit("permission_resolved", {
+          request_id: requestId,
+          decision: "deny",
+          reason: "session_ended",
+        });
+      } catch (err) {
+        console.error(
+          `cc-deck: failed to emit terminal permission_resolved for ${requestId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
     // Flip status BEFORE draining so any emit() racing with finalize sees
     // the ended flag and short-circuits instead of queueing new writes
     // onto a writer we're about to close.
@@ -374,7 +399,10 @@ export class Session {
     // stream loops see the aborted signal promptly.
     this.endedController.abort();
     // Reject any still-parked approvals so the gate's curl calls don't hang
-    // indefinitely on a dead subprocess.
+    // indefinitely on a dead subprocess. The /hook/approval handler will
+    // try to emit its own permission_resolved when the promise resolves —
+    // that emit hits the status-ended short-circuit, so there's no
+    // duplicate JSONL entry.
     const hadPending = this.pendingApprovals.size > 0;
     for (const [, pending] of this.pendingApprovals) {
       try {
@@ -486,6 +514,15 @@ export class Session {
     if (this.yoloMode === enabled) return this.yoloMode;
     await this.emit("yolo_mode_changed", { enabled });
     this.yoloMode = enabled;
+    try {
+      this.callbacks.onYoloChanged?.(this, this.yoloMode);
+    } catch (e) {
+      console.error(
+        `cc-deck: onYoloChanged callback failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
     if (this.yoloMode) this.drainParkedFor(() => true);
     return this.yoloMode;
   }

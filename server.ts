@@ -219,6 +219,13 @@ async function eventsForSession(session: Session, c: Context) {
   });
 }
 
+const SID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidSid(sid: string): boolean {
+  return SID_PATTERN.test(sid);
+}
+
 function parseEventsSince(contents: string, since: number): EnvelopeEvent[] {
   const events: EnvelopeEvent[] = [];
   for (const line of contents.split("\n")) {
@@ -538,6 +545,13 @@ app.get("/:sid/stream", (c) => {
 
 app.get("/:sid/events", async (c) => {
   const sid = c.req.param("sid");
+  // Validate sid before falling through to the filesystem — the archived
+  // path joins sid into sessionsDir, and a URL-encoded traversal like
+  // `..%2F..%2Fetc%2Fpasswd` would otherwise let a tailnet peer read
+  // arbitrary *.jsonl files the server has access to. sids are generated
+  // by randomUUID() so a strict UUID-v4 regex is tight enough without
+  // needing a path-prefix check.
+  if (!isValidSid(sid)) return c.json({ error: "invalid sid" }, 400);
   const session = manager.get(sid);
   if (session) return eventsForSession(session, c);
   // Fall through to on-disk JSONL for sessions that aren't loaded in
@@ -585,9 +599,10 @@ app.get("/sessions", async (c) => {
   // Scan data/sessions/*.jsonl for sessions from prior runs. Ordered newest
   // first by lastActivityTs so the PWA can render without a second sort.
   const archived = await manager.listArchivedSnapshots();
-  const merged = [...inMemory, ...archived].sort((a, b) =>
-    a.lastActivityTs < b.lastActivityTs ? 1 : -1,
-  );
+  const merged = [...inMemory, ...archived].sort((a, b) => {
+    if (a.lastActivityTs === b.lastActivityTs) return 0;
+    return a.lastActivityTs < b.lastActivityTs ? 1 : -1;
+  });
   return c.json({ sessions: merged });
 });
 
@@ -601,6 +616,12 @@ app.get("/sessions", async (c) => {
 app.get("/inbox", (c) => {
   return streamSSE(c, async (stream) => {
     const signal = c.req.raw.signal;
+    // Per-connection buffer of deltas pending writeSSE. Unbounded by
+    // design for v0: each delta is ~100 bytes, sessions move slowly, and
+    // snapshot-on-reconnect makes drop-on-overflow safe if we ever need
+    // to cap it. If a backgrounded client on a busy server ever shows up
+    // as a memory regression, swap this for a ring buffer + forced close
+    // on overflow — the reconnect will pull a fresh snapshot.
     const queue: import("./session-manager").InboxDelta[] = [];
     let notify: (() => void) | null = null;
     const unsub = manager.subscribeInbox((delta) => {

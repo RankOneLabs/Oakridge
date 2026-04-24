@@ -39,7 +39,8 @@ export type InboxDelta =
   | { type: "session_ended"; sid: string }
   | { type: "status_changed"; sid: string; status: SessionStatus }
   | { type: "pending_count_changed"; sid: string; count: number }
-  | { type: "last_activity_changed"; sid: string; ts: string };
+  | { type: "last_activity_changed"; sid: string; ts: string }
+  | { type: "yolo_changed"; sid: string; yoloMode: boolean };
 
 export interface InboxSnapshot {
   sessions: SessionSnapshot[];
@@ -111,6 +112,13 @@ export class SessionManager {
         },
         onLastActivityChanged: (s, ts) => {
           this.scheduleActivityDelta(s.oakridgeSid, ts);
+        },
+        onYoloChanged: (s, yoloMode) => {
+          this.broadcastDelta({
+            type: "yolo_changed",
+            sid: s.oakridgeSid,
+            yoloMode,
+          });
         },
       },
     });
@@ -271,17 +279,20 @@ export class SessionManager {
     const delay = LAST_ACTIVITY_THROTTLE_MS - elapsed;
     const timer = setTimeout(() => {
       this.pendingActivityTimers.delete(sid);
-      const session = this.sessions.get(sid);
-      if (!session) return;
-      const snap = session.snapshot();
-      this.lastActivityFlushAt.set(sid, Date.now());
-      this.broadcastDelta({
-        type: "last_activity_changed",
-        sid,
-        ts: snap.lastActivityTs,
-      });
+      this.flushActivity(sid);
     }, delay);
     this.pendingActivityTimers.set(sid, timer);
+  }
+
+  private flushActivity(sid: string): void {
+    const session = this.sessions.get(sid);
+    if (!session) return;
+    this.lastActivityFlushAt.set(sid, Date.now());
+    this.broadcastDelta({
+      type: "last_activity_changed",
+      sid,
+      ts: session.snapshot().lastActivityTs,
+    });
   }
 
   private clearActivityTimer(sid: string): void {
@@ -289,6 +300,10 @@ export class SessionManager {
     if (timer) {
       clearTimeout(timer);
       this.pendingActivityTimers.delete(sid);
+      // Flush the latest activity ts on teardown so a session that ends
+      // inside the throttle window doesn't strand its final
+      // subprocess_exited/last-emit ts in a cancelled trailing timer.
+      this.flushActivity(sid);
     }
     this.lastActivityFlushAt.delete(sid);
   }

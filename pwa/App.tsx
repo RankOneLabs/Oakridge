@@ -30,7 +30,8 @@ type InboxDelta =
   | { type: "session_ended"; sid: string }
   | { type: "status_changed"; sid: string; status: SessionStatus }
   | { type: "pending_count_changed"; sid: string; count: number }
-  | { type: "last_activity_changed"; sid: string; ts: string };
+  | { type: "last_activity_changed"; sid: string; ts: string }
+  | { type: "yolo_changed"; sid: string; yoloMode: boolean };
 
 type Status = "connecting" | "connected" | "disconnected";
 type Theme = "dark" | "light";
@@ -202,6 +203,11 @@ function applyDelta(
       if (s) next.set(delta.sid, { ...s, lastActivityTs: delta.ts });
       break;
     }
+    case "yolo_changed": {
+      const s = next.get(delta.sid);
+      if (s) next.set(delta.sid, { ...s, yoloMode: delta.yoloMode });
+      break;
+    }
   }
   return next;
 }
@@ -335,9 +341,10 @@ function sortSessions(sessions: Map<string, SessionSnapshot>): SessionSnapshot[]
   // Sort by last activity, newest first. Pending-approval sessions don't
   // float — the pending badge is visible enough, and operators told us
   // they'd rather preserve predictable chronological order.
-  return [...sessions.values()].sort((a, b) =>
-    a.lastActivityTs < b.lastActivityTs ? 1 : -1,
-  );
+  return [...sessions.values()].sort((a, b) => {
+    if (a.lastActivityTs === b.lastActivityTs) return 0;
+    return a.lastActivityTs < b.lastActivityTs ? 1 : -1;
+  });
 }
 
 function SessionRow({
@@ -548,6 +555,7 @@ function SessionView({
         resolutions={resolutions}
         allowedTools={allowedTools}
         sid={sid}
+        canApprove={canInput}
       />
       {canInput && <InputBox sid={sid} />}
       {!canInput && snapshot?.status === "ended" && (
@@ -675,11 +683,13 @@ function EventList({
   resolutions,
   allowedTools,
   sid,
+  canApprove,
 }: {
   events: EnvelopeEvent[];
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
   sid: string;
+  canApprove: boolean;
 }) {
   return (
     <div className="events">
@@ -690,6 +700,7 @@ function EventList({
           resolutions={resolutions}
           allowedTools={allowedTools}
           sid={sid}
+          canApprove={canApprove}
         />
       ))}
     </div>
@@ -701,11 +712,13 @@ function EventRow({
   resolutions,
   allowedTools,
   sid,
+  canApprove,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
   sid: string;
+  canApprove: boolean;
 }) {
   switch (event.type) {
     case "user":
@@ -719,6 +732,7 @@ function EventRow({
           resolutions={resolutions}
           allowedTools={allowedTools}
           sid={sid}
+          canApprove={canApprove}
         />
       );
     case "permission_resolved":
@@ -890,11 +904,13 @@ function PermissionRow({
   resolutions,
   allowedTools,
   sid,
+  canApprove,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
   sid: string;
+  canApprove: boolean;
 }) {
   const p = event.payload as PermissionRequestPayload;
   const resolution = resolutions.get(p.request_id);
@@ -906,6 +922,21 @@ function PermissionRow({
       <div className="row row-system">
         <div className={`notice notice-${resolution}`}>
           {resolution === "allow" ? "approved" : "denied"} · {p.tool_name}
+        </div>
+      </div>
+    );
+  }
+
+  // An unresolved permission_request on a non-live session means either
+  // finalize's terminal deny never made it to the JSONL (server crash)
+  // or the session ended between render and action. Either way the
+  // approval endpoint would 404/409 — collapse the card to a muted
+  // read-only notice so the operator doesn't tap a button that can't act.
+  if (!canApprove) {
+    return (
+      <div className="row row-system">
+        <div className="notice notice-muted">
+          unresolved · {p.tool_name} (session ended)
         </div>
       </div>
     );
