@@ -10,11 +10,30 @@ export interface EnvelopeEvent {
 }
 
 type Status = "connecting" | "connected" | "disconnected";
+type Theme = "dark" | "light";
 type ResolutionMap = Map<string, "allow" | "deny">;
+
+const THEME_STORAGE_KEY = "oakridge.theme";
+
+function readStoredTheme(): Theme {
+  // SSR-safe guard; also swallows SecurityError from sandboxed localStorage.
+  try {
+    const v = localStorage.getItem(THEME_STORAGE_KEY);
+    if (v === "light" || v === "dark") return v;
+  } catch {}
+  return "dark";
+}
 
 export function App() {
   const [events, setEvents] = useState<EnvelopeEvent[]>([]);
   const [status, setStatus] = useState<Status>("connecting");
+  const [theme, setTheme] = useState<Theme>(readStoredTheme);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {}
+  }, [theme]);
   // Maintain the resolutions map incrementally (O(1) per event) rather than
   // recomputing across the whole events array on every render.
   const [resolutions, setResolutions] = useState<ResolutionMap>(
@@ -109,6 +128,10 @@ export function App() {
         eventCount={events.length}
         sessionId={sessionId}
         yoloMode={yoloMode}
+        theme={theme}
+        onToggleTheme={() =>
+          setTheme((prev) => (prev === "dark" ? "light" : "dark"))
+        }
       />
       <EventList
         events={events}
@@ -130,11 +153,15 @@ function TopBar({
   eventCount,
   sessionId,
   yoloMode,
+  theme,
+  onToggleTheme,
 }: {
   status: Status;
   eventCount: number;
   sessionId: string | null;
   yoloMode: boolean;
+  theme: Theme;
+  onToggleTheme: () => void;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -170,6 +197,23 @@ function TopBar({
     <header className="top-bar">
       <span className={`status status-${status}`}>{status}</span>
       <span className="event-count">{eventCount} events</span>
+      <button
+        type="button"
+        className="theme-toggle"
+        onClick={onToggleTheme}
+        title={
+          theme === "dark"
+            ? "Switch to light mode"
+            : "Switch to dark mode"
+        }
+        aria-label={
+          theme === "dark"
+            ? "Switch to light mode"
+            : "Switch to dark mode"
+        }
+      >
+        {theme === "dark" ? "LIGHT" : "DARK"}
+      </button>
       <button
         type="button"
         className={`yolo-toggle ${yoloMode ? "is-on" : ""}`}

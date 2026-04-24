@@ -14,6 +14,18 @@
     <meta name="apple-mobile-web-app-title" content="cc-deck" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>cc-deck</title>
+    <script>
+      // Apply stored theme before first paint to avoid a dark→light flash on
+      // reload for light-mode users. Kept inline and tiny so it's parsed
+      // before the module script below. Key must match THEME_STORAGE_KEY in
+      // App.tsx.
+      try {
+        var t = localStorage.getItem("oakridge.theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.dataset.theme = t;
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="app"></div>
