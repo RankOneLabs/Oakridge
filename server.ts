@@ -553,7 +553,7 @@ const cmd = [
   "--include-hook-events",
   "--replay-user-messages",
   "--verbose",
-  "--setting-sources", "",
+  "--setting-sources", "user",
   "--settings", settingsPath,
 ];
 
