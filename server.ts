@@ -1,11 +1,20 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { serveStatic } from "hono/bun";
 import { streamSSE } from "hono/streaming";
 import { parseArgs } from "node:util";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { SessionManager } from "./session-manager";
+import {
+  Session,
+  SessionNotReadyError,
+  type Decision,
+  type EnvelopeEvent,
+  type SpawnCmd,
+} from "./session";
 
 // === args ===
 
@@ -37,494 +46,14 @@ if (!Number.isInteger(port) || port <= 0 || port > 65535) {
 const host = values.host ?? "127.0.0.1";
 const claudeBin = values.claudeBin ?? "claude";
 
-// Resolve defaults from the server.ts location so data/ and pwa/dist/ don't
-// depend on where the operator ran the command from. Operator override via
-// --dataDir still works.
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const dataDir = values.dataDir ?? join(moduleDir, "data");
 const pwaDistDir = join(moduleDir, "pwa", "dist");
-
-// === session init ===
-
-const sessionId = randomUUID();
 const sessionsDir = join(dataDir, "sessions");
 await mkdir(sessionsDir, { recursive: true });
-const jsonlPath = join(sessionsDir, `${sessionId}.jsonl`);
 
-const jsonlWriter = Bun.file(jsonlPath).writer();
+// === settings.json for spawned CC (shared across all sessions) ===
 
-let nextId = 0;
-
-interface EnvelopeEvent {
-  id: number;
-  type: string;
-  ts: string;
-  payload: unknown;
-}
-
-type Subscriber = (evt: EnvelopeEvent) => void;
-const subscribers = new Set<Subscriber>();
-
-function subscribe(cb: Subscriber): () => void {
-  subscribers.add(cb);
-  return () => subscribers.delete(cb);
-}
-
-async function readJsonlOrEmpty(path: string): Promise<string> {
-  // The JSONL file is created lazily on the first emit. Clients hitting
-  // /stream or /events before that first emit would see ENOENT; treat that
-  // as an empty transcript rather than failing the request.
-  try {
-    return await readFile(path, "utf8");
-  } catch (err) {
-    if (
-      err &&
-      typeof err === "object" &&
-      "code" in err &&
-      (err as { code: string }).code === "ENOENT"
-    ) {
-      return "";
-    }
-    throw err;
-  }
-}
-
-async function emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
-  const evt: EnvelopeEvent = {
-    id: nextId++,
-    type,
-    ts: new Date().toISOString(),
-    payload,
-  };
-  jsonlWriter.write(JSON.stringify(evt) + "\n");
-  await jsonlWriter.flush();
-  for (const cb of subscribers) {
-    try {
-      cb(evt);
-    } catch {
-      // one subscriber's failure shouldn't affect others
-    }
-  }
-  return evt;
-}
-
-// === http bind (fail fast before spawning CC) ===
-
-const app = new Hono();
-
-app.get("/stream", (c) => {
-  const signal = c.req.raw.signal;
-  // EventSource replays Last-Event-ID on automatic reconnect. Resume from
-  // there instead of re-sending the entire transcript each time.
-  const lastEventIdHeader = c.req.header("last-event-id");
-  const parsedResumeId = lastEventIdHeader ? Number(lastEventIdHeader) : NaN;
-  const resumeAfter = Number.isFinite(parsedResumeId) ? parsedResumeId : -1;
-  return streamSSE(c, async (stream) => {
-    const pending: EnvelopeEvent[] = [];
-    let notify: (() => void) | null = null;
-    const unsub = subscribe((evt) => {
-      pending.push(evt);
-      if (notify) {
-        const n = notify;
-        notify = null;
-        n();
-      }
-    });
-
-    // Wake the wait loop if the client disconnects while idle, so the finally
-    // block runs promptly instead of leaking the heartbeat + subscriber.
-    const onAbort = () => {
-      if (notify) {
-        const n = notify;
-        notify = null;
-        n();
-      }
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-
-    // 15s heartbeat so mobile carriers don't drop the connection
-    const heartbeat = setInterval(() => {
-      stream.write(": ping\n\n").catch(() => {});
-    }, 15000);
-
-    let sentUpTo = resumeAfter;
-    try {
-      // catchup: replay events from the JSONL that the client hasn't seen.
-      const contents = await readJsonlOrEmpty(jsonlPath);
-      for (const line of contents.split("\n")) {
-        if (!line.trim()) continue;
-        let evt: EnvelopeEvent;
-        try {
-          evt = JSON.parse(line) as EnvelopeEvent;
-        } catch {
-          // Partial line from a crash, or a corrupted byte — log and keep going
-          // rather than tearing down the SSE setup.
-          console.error(
-            `cc-deck: skipping malformed JSONL line: ${line.slice(0, 120)}`,
-          );
-          continue;
-        }
-        if (evt.id <= sentUpTo) continue; // already on the client via Last-Event-ID
-        sentUpTo = evt.id;
-        await stream.writeSSE({
-          event: "message",
-          data: JSON.stringify(evt),
-          id: String(evt.id),
-        });
-      }
-
-      // live: drain new events as they arrive
-      while (!signal.aborted) {
-        if (pending.length === 0) {
-          await new Promise<void>((r) => {
-            notify = r;
-          });
-          continue;
-        }
-        const evt = pending.shift()!;
-        if (evt.id <= sentUpTo) continue; // dedupe against catchup
-        sentUpTo = evt.id;
-        await stream.writeSSE({
-          event: "message",
-          data: JSON.stringify(evt),
-          id: String(evt.id),
-        });
-      }
-    } finally {
-      clearInterval(heartbeat);
-      signal.removeEventListener("abort", onAbort);
-      unsub();
-    }
-  });
-});
-
-app.get("/events", async (c) => {
-  const sinceRaw = c.req.query("since");
-  const since = sinceRaw !== undefined ? Number(sinceRaw) : -1;
-  if (!Number.isFinite(since)) {
-    return c.json({ error: "invalid since" }, 400);
-  }
-  const contents = await readJsonlOrEmpty(jsonlPath);
-  const events: EnvelopeEvent[] = [];
-  for (const line of contents.split("\n")) {
-    if (!line.trim()) continue;
-    let evt: EnvelopeEvent;
-    try {
-      evt = JSON.parse(line) as EnvelopeEvent;
-    } catch {
-      console.error(
-        `cc-deck: skipping malformed JSONL line: ${line.slice(0, 120)}`,
-      );
-      continue;
-    }
-    if (evt.id > since) events.push(evt);
-  }
-  return c.json({ session_id: sessionId, events });
-});
-
-let inputQueue: Promise<unknown> = Promise.resolve();
-
-app.post("/input", async (c) => {
-  let body: { text?: unknown };
-  try {
-    body = (await c.req.json()) as { text?: unknown };
-  } catch {
-    return c.json({ error: "invalid json" }, 400);
-  }
-  if (typeof body.text !== "string") {
-    return c.json({ error: "text must be a string" }, 400);
-  }
-  const text = body.text.trim();
-  if (text.length === 0) {
-    return c.json({ error: "text must be non-empty" }, 400);
-  }
-  if (!proc) {
-    // Window at startup: HTTP server binds before Bun.spawn runs.
-    return c.json({ error: "subprocess not ready" }, 503);
-  }
-  const stdin = proc.stdin as import("bun").FileSink;
-  const task = async () => {
-    const line =
-      JSON.stringify({
-        type: "user",
-        message: { role: "user", content: text },
-      }) + "\n";
-    stdin.write(line);
-    await stdin.flush();
-  };
-  try {
-    inputQueue = inputQueue.then(task, task);
-    await inputQueue;
-  } catch (err) {
-    // Subprocess exited between our ready-check and the write (EPIPE etc.).
-    const msg = err instanceof Error ? err.message : String(err);
-    return c.json({ error: `subprocess write failed: ${msg}` }, 503);
-  }
-  return c.json({ ok: true });
-});
-
-// === approval plumbing ===
-
-type Decision = "allow" | "deny";
-interface PendingApproval {
-  resolve: (d: Decision) => void;
-  toolName: string;
-}
-const pendingApprovals = new Map<string, PendingApproval>();
-
-// Session-scoped auto-approve state. Both reset when the server restarts.
-// Persisted indirectly via the JSONL event log — yolo_mode_changed and
-// tool_allowlisted events let reconnecting clients rebuild the same state.
-let yoloMode = false;
-const allowedTools = new Set<string>();
-
-function drainParkedFor(predicate: (a: PendingApproval) => boolean): void {
-  for (const [requestId, pending] of pendingApprovals) {
-    if (!predicate(pending)) continue;
-    pendingApprovals.delete(requestId);
-    pending.resolve("allow");
-  }
-}
-
-interface HookInput {
-  session_id: string;
-  tool_name: string;
-  tool_input: unknown;
-  tool_use_id: string;
-  hook_event_name: string;
-}
-
-app.post("/hook/approval", async (c) => {
-  // only accept from 127.0.0.1 — the gate runs in our process tree
-  if (!bunServer) return c.text("server not ready", 503);
-  const info = bunServer.requestIP(c.req.raw);
-  if (!info || (info.address !== "127.0.0.1" && info.address !== "::1")) {
-    return c.text("forbidden", 403);
-  }
-
-  let hook: HookInput;
-  try {
-    hook = (await c.req.json()) as HookInput;
-  } catch {
-    return c.json({ error: "invalid json" }, 400);
-  }
-  if (hook.hook_event_name !== "PreToolUse") {
-    return c.json({ error: `unexpected hook_event_name: ${hook.hook_event_name}` }, 400);
-  }
-
-  // Auto-approve: yolo mode short-circuits everything; per-tool allowlist
-  // short-circuits matching tools. Emit a notice so the operator can still
-  // see what ran without prompting them.
-  const autoReason = yoloMode
-    ? "yolo"
-    : allowedTools.has(hook.tool_name)
-      ? "allowlist"
-      : null;
-  if (autoReason) {
-    await emit("permission_auto_approved", {
-      tool_name: hook.tool_name,
-      tool_input: hook.tool_input,
-      tool_use_id: hook.tool_use_id,
-      reason: autoReason,
-    });
-    return c.json({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "allow",
-        permissionDecisionReason:
-          autoReason === "yolo"
-            ? "auto-approved (yolo mode)"
-            : `auto-approved (always allow ${hook.tool_name})`,
-      },
-    });
-  }
-
-  const requestId = randomUUID();
-  const signal = c.req.raw.signal;
-
-  // Install the waiter and abort listener before any await, so /approval can't
-  // arrive before the map entry exists.
-  let resolveDecision: (d: Decision) => void;
-  let rejectDecision: (e: Error) => void;
-  const decisionPromise = new Promise<Decision>((res, rej) => {
-    resolveDecision = res;
-    rejectDecision = rej;
-  });
-  pendingApprovals.set(requestId, {
-    resolve: resolveDecision!,
-    toolName: hook.tool_name,
-  });
-  // If the gate's curl is aborted (CC killed, --max-time expired, server
-  // shutting down), reject so we don't leak the map entry forever.
-  signal.addEventListener(
-    "abort",
-    () => rejectDecision!(new Error("gate_aborted")),
-    { once: true },
-  );
-
-  try {
-    // Await instead of fire-and-forget so a failing emit (disk full,
-    // permission error) surfaces through the outer catch rather than
-    // becoming an unhandled rejection.
-    await emit("permission_request", {
-      request_id: requestId,
-      tool_name: hook.tool_name,
-      tool_input: hook.tool_input,
-      tool_use_id: hook.tool_use_id,
-    });
-
-    const decision = await decisionPromise;
-
-    await emit("permission_resolved", { request_id: requestId, decision });
-
-    return c.json({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: decision,
-        permissionDecisionReason:
-          decision === "allow"
-            ? "operator approved via cc-deck"
-            : "operator denied via cc-deck",
-      },
-    });
-  } catch (err) {
-    const isGateAbort =
-      err instanceof Error && err.message === "gate_aborted";
-    pendingApprovals.delete(requestId);
-    if (isGateAbort) {
-      // Operator-visible: the gate request was cancelled before a decision.
-      // Best-effort notify connected UI clients so the card clears.
-      await emit("permission_resolved", {
-        request_id: requestId,
-        decision: "deny",
-        reason: "gate_aborted",
-      }).catch((e) => {
-        console.error(
-          `cc-deck: failed to emit gate-aborted resolution: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      });
-      return c.json({ error: "gate aborted" }, 408);
-    }
-    // Unexpected failure (e.g. emit() threw on disk/perm error). Log and
-    // report distinctly from an abort so the caller can tell them apart.
-    console.error(
-      `cc-deck: /hook/approval failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return c.json({ error: "internal error" }, 500);
-  }
-});
-
-app.post("/approval", async (c) => {
-  let body: { request_id?: unknown; decision?: unknown; scope?: unknown };
-  try {
-    body = (await c.req.json()) as {
-      request_id?: unknown;
-      decision?: unknown;
-      scope?: unknown;
-    };
-  } catch {
-    return c.json({ error: "invalid json" }, 400);
-  }
-  if (typeof body.request_id !== "string") {
-    return c.json({ error: "request_id must be a string" }, 400);
-  }
-  if (body.decision !== "approve" && body.decision !== "deny") {
-    return c.json({ error: "decision must be 'approve' or 'deny'" }, 400);
-  }
-  if (body.scope !== undefined && body.scope !== "once" && body.scope !== "always") {
-    return c.json({ error: "scope must be 'once' or 'always'" }, 400);
-  }
-  const pending = pendingApprovals.get(body.request_id);
-  if (!pending) {
-    return c.json({ error: "unknown or already-resolved request_id" }, 404);
-  }
-  pendingApprovals.delete(body.request_id);
-  pending.resolve(body.decision === "approve" ? "allow" : "deny");
-
-  // "Always" only applies to approves — denying never adds to the allowlist.
-  // The pending request is already resolved at this point, so the underlying
-  // tool will run regardless of what happens here. Treat the allowlist work
-  // as a soft side-effect: if it fails, log and degrade to "we'll prompt
-  // again next time" rather than 500ing a request that effectively succeeded.
-  if (body.scope === "always" && body.decision === "approve") {
-    try {
-      if (!allowedTools.has(pending.toolName)) {
-        // Emit before mutating so server state never diverges from what a
-        // reconnecting client can rebuild via JSONL replay.
-        await emit("tool_allowlisted", { tool_name: pending.toolName });
-        allowedTools.add(pending.toolName);
-      }
-      // Drain any other parked requests for the same tool so the operator
-      // doesn't have to tap through them individually.
-      drainParkedFor((p) => p.toolName === pending.toolName);
-    } catch (err) {
-      console.error(
-        `cc-deck: allowlist side-effect for ${pending.toolName} failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-  return c.json({ ok: true });
-});
-
-app.post("/yolo", async (c) => {
-  let body: { enabled?: unknown };
-  try {
-    body = (await c.req.json()) as { enabled?: unknown };
-  } catch {
-    return c.json({ error: "invalid json" }, 400);
-  }
-  if (typeof body.enabled !== "boolean") {
-    return c.json({ error: "enabled must be a boolean" }, 400);
-  }
-  if (yoloMode !== body.enabled) {
-    // Emit before mutating so server state never diverges from what a
-    // reconnecting client can rebuild via JSONL replay. If emit throws
-    // we abort before flipping yoloMode, so a partial-success leak (yolo
-    // on but no record + no drain) can't happen.
-    await emit("yolo_mode_changed", { enabled: body.enabled });
-    yoloMode = body.enabled;
-  }
-  // Enabling yolo also drains everything currently parked.
-  if (yoloMode) drainParkedFor(() => true);
-  return c.json({ ok: true, enabled: yoloMode });
-});
-
-// === static PWA (built into pwa/dist/ via `bun run build:pwa`) ===
-
-app.use(
-  "/*",
-  serveStatic({
-    root: pwaDistDir,
-    rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
-  }),
-);
-
-let bunServer: ReturnType<typeof Bun.serve> | null = null;
-try {
-  bunServer = Bun.serve({
-    port,
-    hostname: host,
-    // SSE streams are long-lived; Bun defaults to 10s per request which
-    // drops the connection before our 15s heartbeat fires. Hook approval
-    // requests also park for as long as the operator takes to tap.
-    idleTimeout: 255,
-    fetch: app.fetch,
-  });
-} catch (err) {
-  const msg = err instanceof Error ? err.message : String(err);
-  console.error(`cc-deck: failed to bind port ${port}: ${msg}`);
-  console.error(`is another cc-deck running? try: lsof -i :${port}`);
-  process.exit(1);
-}
-const server = bunServer;
-
-console.error(
-  `cc-deck listening on http://${server.hostname}:${server.port}, workdir=${workdir}, session=${sessionId}`,
-);
-
-// === spawn CC subprocess ===
-
-// generate a settings.json that registers gate.sh as the PreToolUse hook
 const gatePath = resolve(moduleDir, "scripts", "gate.sh");
 const settingsPath = join(dataDir, "settings.json");
 await writeFile(
@@ -545,143 +74,596 @@ await writeFile(
   ),
 );
 
-const cmd = [
-  claudeBin,
-  "--print",
-  "--input-format", "stream-json",
-  "--output-format", "stream-json",
-  "--include-hook-events",
-  "--replay-user-messages",
-  "--verbose",
-  "--setting-sources", "user",
-  "--settings", settingsPath,
-];
+// === spawn command builder ===
 
-await emit("session_started", { command: cmd, workdir, sessionId });
-
-let proc: ReturnType<typeof Bun.spawn> | null = null;
-try {
-  proc = Bun.spawn({
+function buildSpawnCmd(session: Session): SpawnCmd {
+  const cmd = [
+    claudeBin,
+    "--print",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--include-hook-events",
+    "--replay-user-messages",
+    "--verbose",
+    "--setting-sources",
+    "user",
+    "--settings",
+    settingsPath,
+  ];
+  // Resume in a fresh session id so multiple live forks off the same parent
+  // don't collide on CC's internal session id.
+  if (session.parentCcSid) {
+    cmd.push("--resume", session.parentCcSid, "--fork-session");
+  }
+  return {
     cmd,
-    cwd: workdir,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
+    cwd: session.workdir,
     env: {
       ...process.env,
       CC_DECK_PORT: String(port),
-    },
+    } as Record<string, string>,
+  };
+}
+
+// === manager ===
+
+const manager = new SessionManager({ sessionsDir, buildSpawnCmd });
+
+// === HTTP handlers ===
+
+async function streamForSession(session: Session, c: Context) {
+  const signal = c.req.raw.signal;
+  const lastEventIdHeader = c.req.header("last-event-id");
+  const parsedResumeId = lastEventIdHeader ? Number(lastEventIdHeader) : NaN;
+  const resumeAfter = Number.isFinite(parsedResumeId) ? parsedResumeId : -1;
+  return streamSSE(c, async (stream) => {
+    const pending: EnvelopeEvent[] = [];
+    let notify: (() => void) | null = null;
+    const unsub = session.subscribe((evt) => {
+      pending.push(evt);
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
+    });
+    const onAbort = () => {
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    const heartbeat = setInterval(() => {
+      stream.write(": ping\n\n").catch(() => {});
+    }, 15000);
+    let sentUpTo = resumeAfter;
+    try {
+      const contents = await session.readJsonl();
+      for (const line of contents.split("\n")) {
+        if (!line.trim()) continue;
+        let evt: EnvelopeEvent;
+        try {
+          evt = JSON.parse(line) as EnvelopeEvent;
+        } catch {
+          console.error(
+            `cc-deck: skipping malformed JSONL line: ${line.slice(0, 120)}`,
+          );
+          continue;
+        }
+        if (evt.id <= sentUpTo) continue;
+        sentUpTo = evt.id;
+        await stream.writeSSE({
+          event: "message",
+          data: JSON.stringify(evt),
+          id: String(evt.id),
+        });
+      }
+      while (!signal.aborted) {
+        if (pending.length === 0) {
+          await new Promise<void>((r) => {
+            notify = r;
+          });
+          continue;
+        }
+        const evt = pending.shift()!;
+        if (evt.id <= sentUpTo) continue;
+        sentUpTo = evt.id;
+        await stream.writeSSE({
+          event: "message",
+          data: JSON.stringify(evt),
+          id: String(evt.id),
+        });
+      }
+    } finally {
+      clearInterval(heartbeat);
+      signal.removeEventListener("abort", onAbort);
+      unsub();
+    }
+  });
+}
+
+async function eventsForSession(session: Session, c: Context) {
+  const sinceRaw = c.req.query("since");
+  const since = sinceRaw !== undefined ? Number(sinceRaw) : -1;
+  if (!Number.isFinite(since)) {
+    return c.json({ error: "invalid since" }, 400);
+  }
+  const contents = await session.readJsonl();
+  const events: EnvelopeEvent[] = [];
+  for (const line of contents.split("\n")) {
+    if (!line.trim()) continue;
+    let evt: EnvelopeEvent;
+    try {
+      evt = JSON.parse(line) as EnvelopeEvent;
+    } catch {
+      console.error(
+        `cc-deck: skipping malformed JSONL line: ${line.slice(0, 120)}`,
+      );
+      continue;
+    }
+    if (evt.id > since) events.push(evt);
+  }
+  return c.json({ session_id: session.oakridgeSid, events });
+}
+
+async function inputForSession(session: Session, c: Context) {
+  let body: { text?: unknown };
+  try {
+    body = (await c.req.json()) as { text?: unknown };
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (typeof body.text !== "string") {
+    return c.json({ error: "text must be a string" }, 400);
+  }
+  const text = body.text.trim();
+  if (text.length === 0) {
+    return c.json({ error: "text must be non-empty" }, 400);
+  }
+  try {
+    await session.writeInput(text);
+  } catch (err) {
+    if (err instanceof SessionNotReadyError) {
+      return c.json({ error: "subprocess not ready" }, 503);
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `subprocess write failed: ${msg}` }, 503);
+  }
+  return c.json({ ok: true });
+}
+
+async function yoloForSession(session: Session, c: Context) {
+  let body: { enabled?: unknown };
+  try {
+    body = (await c.req.json()) as { enabled?: unknown };
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (typeof body.enabled !== "boolean") {
+    return c.json({ error: "enabled must be a boolean" }, 400);
+  }
+  const enabled = await session.setYolo(body.enabled);
+  return c.json({ ok: true, enabled });
+}
+
+interface ApprovalBody {
+  request_id: string;
+  decision: "approve" | "deny";
+  scope: "once" | "always";
+}
+
+function parseApprovalBody(raw: unknown): ApprovalBody | string {
+  if (typeof raw !== "object" || raw === null) return "invalid json";
+  const body = raw as {
+    request_id?: unknown;
+    decision?: unknown;
+    scope?: unknown;
+  };
+  if (typeof body.request_id !== "string") return "request_id must be a string";
+  if (body.decision !== "approve" && body.decision !== "deny") {
+    return "decision must be 'approve' or 'deny'";
+  }
+  if (
+    body.scope !== undefined &&
+    body.scope !== "once" &&
+    body.scope !== "always"
+  ) {
+    return "scope must be 'once' or 'always'";
+  }
+  return {
+    request_id: body.request_id,
+    decision: body.decision,
+    scope: (body.scope ?? "once") as "once" | "always",
+  };
+}
+
+async function applyApproval(
+  session: Session,
+  body: ApprovalBody,
+  c: Context,
+) {
+  const pending = session.deleteApproval(body.request_id);
+  if (!pending) {
+    return c.json({ error: "unknown or already-resolved request_id" }, 404);
+  }
+  pending.resolve(body.decision === "approve" ? "allow" : "deny");
+  if (body.scope === "always" && body.decision === "approve") {
+    try {
+      await session.allowlistTool(pending.toolName);
+    } catch (err) {
+      console.error(
+        `cc-deck: allowlist side-effect for ${pending.toolName} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+  return c.json({ ok: true });
+}
+
+async function approvalForSession(session: Session, c: Context) {
+  let raw: unknown;
+  try {
+    raw = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  const parsed = parseApprovalBody(raw);
+  if (typeof parsed === "string") return c.json({ error: parsed }, 400);
+  return applyApproval(session, parsed, c);
+}
+
+// === hook payload type ===
+
+interface HookInput {
+  session_id: string;
+  tool_name: string;
+  tool_input: unknown;
+  tool_use_id: string;
+  hook_event_name: string;
+}
+
+// === Hono app ===
+
+const app = new Hono();
+
+// ---- per-sid routes ----
+
+app.get("/:sid/stream", (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return streamForSession(session, c);
+});
+
+app.get("/:sid/events", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return eventsForSession(session, c);
+});
+
+app.post("/:sid/input", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return inputForSession(session, c);
+});
+
+app.post("/:sid/yolo", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return yoloForSession(session, c);
+});
+
+app.post("/:sid/approval", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return approvalForSession(session, c);
+});
+
+// ---- sessions CRUD ----
+
+app.get("/sessions", (c) => c.json({ sessions: manager.listSnapshots() }));
+
+app.post("/sessions", async (c) => {
+  let body: { workdir?: unknown } = {};
+  try {
+    const raw = await c.req.text();
+    body = raw ? (JSON.parse(raw) as { workdir?: unknown }) : {};
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  const sessionWorkdir =
+    typeof body.workdir === "string" && body.workdir.length > 0
+      ? body.workdir
+      : workdir;
+  try {
+    const session = await manager.create({ workdir: sessionWorkdir });
+    return c.json(session.snapshot());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `spawn failed: ${msg}` }, 500);
+  }
+});
+
+app.delete("/sessions/:sid", async (c) => {
+  const sid = c.req.param("sid");
+  const session = manager.get(sid);
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  const code = await session.abort();
+  return c.json({ ok: true, code });
+});
+
+// ---- hook (loopback-only) ----
+
+app.post("/hook/approval", async (c) => {
+  if (!bunServer) return c.text("server not ready", 503);
+  const info = bunServer.requestIP(c.req.raw);
+  if (!info || (info.address !== "127.0.0.1" && info.address !== "::1")) {
+    return c.text("forbidden", 403);
+  }
+
+  let hook: HookInput;
+  try {
+    hook = (await c.req.json()) as HookInput;
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  if (hook.hook_event_name !== "PreToolUse") {
+    return c.json(
+      { error: `unexpected hook_event_name: ${hook.hook_event_name}` },
+      400,
+    );
+  }
+
+  const session = await resolveSessionForHook(hook.session_id);
+  if (!session) {
+    // The gate reached us before system/init mapped this ccSid to a session.
+    // Deny rather than hang so CC isn't wedged waiting on us.
+    return c.json(
+      {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            "cc-deck: no oakridge session for this CC session_id",
+        },
+      },
+      200,
+    );
+  }
+
+  const autoReason = session.yolo
+    ? "yolo"
+    : session.toolAllowlist.has(hook.tool_name)
+      ? "allowlist"
+      : null;
+  if (autoReason) {
+    await session.emit("permission_auto_approved", {
+      tool_name: hook.tool_name,
+      tool_input: hook.tool_input,
+      tool_use_id: hook.tool_use_id,
+      reason: autoReason,
+    });
+    return c.json({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason:
+          autoReason === "yolo"
+            ? "auto-approved (yolo mode)"
+            : `auto-approved (always allow ${hook.tool_name})`,
+      },
+    });
+  }
+
+  const requestId = randomUUID();
+  const signal = c.req.raw.signal;
+  let resolveDecision: (d: Decision) => void;
+  let rejectDecision: (e: Error) => void;
+  const decisionPromise = new Promise<Decision>((res, rej) => {
+    resolveDecision = res;
+    rejectDecision = rej;
+  });
+  session.registerApproval(requestId, {
+    resolve: resolveDecision!,
+    toolName: hook.tool_name,
+  });
+  signal.addEventListener(
+    "abort",
+    () => rejectDecision!(new Error("gate_aborted")),
+    { once: true },
+  );
+
+  try {
+    await session.emit("permission_request", {
+      request_id: requestId,
+      tool_name: hook.tool_name,
+      tool_input: hook.tool_input,
+      tool_use_id: hook.tool_use_id,
+    });
+    const decision = await decisionPromise;
+    await session.emit("permission_resolved", {
+      request_id: requestId,
+      decision,
+    });
+    return c.json({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: decision,
+        permissionDecisionReason:
+          decision === "allow"
+            ? "operator approved via cc-deck"
+            : "operator denied via cc-deck",
+      },
+    });
+  } catch (err) {
+    const isGateAbort =
+      err instanceof Error && err.message === "gate_aborted";
+    session.deleteApproval(requestId);
+    if (isGateAbort) {
+      await session
+        .emit("permission_resolved", {
+          request_id: requestId,
+          decision: "deny",
+          reason: "gate_aborted",
+        })
+        .catch((e) => {
+          console.error(
+            `cc-deck: failed to emit gate-aborted resolution: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+        });
+      return c.json({ error: "gate aborted" }, 408);
+    }
+    console.error(
+      `cc-deck: /hook/approval failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return c.json({ error: "internal error" }, 500);
+  }
+});
+
+/**
+ * Map a hook's CC session_id to our Session. Waits briefly if the
+ * manager hasn't seen the ccSid yet: CC emits system/init before any
+ * PreToolUse under normal conditions, but hooks and stdout are separate
+ * pipes and in theory could race. 2s should cover any realistic scheduling
+ * jitter while still failing fast on a genuinely-unknown ccSid.
+ */
+async function resolveSessionForHook(
+  ccSid: string,
+): Promise<Session | undefined> {
+  const deadline = Date.now() + 2000;
+  while (true) {
+    const session = manager.getByCcSid(ccSid);
+    if (session) return session;
+    if (Date.now() >= deadline) return undefined;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+// ---- legacy aliases (temporary bridge so today's PWA keeps working) ----
+
+function requireSingleLive(
+  c: Context,
+): Session | Response {
+  const session = manager.getSingleLive();
+  if (!session) {
+    return c.json(
+      {
+        error:
+          "no single live session — use /:sid/<route> for multi-session clients",
+      },
+      409,
+    );
+  }
+  return session;
+}
+
+app.get("/stream", (c) => {
+  const s = requireSingleLive(c);
+  if (!(s instanceof Session)) return s;
+  return streamForSession(s, c);
+});
+
+app.get("/events", async (c) => {
+  const s = requireSingleLive(c);
+  if (!(s instanceof Session)) return s;
+  return eventsForSession(s, c);
+});
+
+app.post("/input", async (c) => {
+  const s = requireSingleLive(c);
+  if (!(s instanceof Session)) return s;
+  return inputForSession(s, c);
+});
+
+app.post("/yolo", async (c) => {
+  const s = requireSingleLive(c);
+  if (!(s instanceof Session)) return s;
+  return yoloForSession(s, c);
+});
+
+app.post("/approval", async (c) => {
+  // Legacy /approval body doesn't carry a sid. Scan live sessions by
+  // request_id (UUIDs, globally unique). Keeps today's PWA working until
+  // it migrates to /:sid/approval in PR 2.
+  let raw: unknown;
+  try {
+    raw = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+  const parsed = parseApprovalBody(raw);
+  if (typeof parsed === "string") return c.json({ error: parsed }, 400);
+  const owningSession = manager
+    .list()
+    .find((s) => s.hasApproval(parsed.request_id));
+  if (!owningSession) {
+    return c.json({ error: "unknown or already-resolved request_id" }, 404);
+  }
+  return applyApproval(owningSession, parsed, c);
+});
+
+// ---- static PWA ----
+
+app.use(
+  "/*",
+  serveStatic({
+    root: pwaDistDir,
+    rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
+  }),
+);
+
+// === bind port (fail fast before spawning CC) ===
+
+let bunServer: ReturnType<typeof Bun.serve> | null = null;
+try {
+  bunServer = Bun.serve({
+    port,
+    hostname: host,
+    idleTimeout: 255,
+    fetch: app.fetch,
   });
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
-  await emit("subprocess_exited", { code: -1, reason: `spawn failed: ${msg}` });
-  server.stop();
-  console.error(`cc-deck: failed to spawn CC subprocess: ${msg}`);
+  console.error(`cc-deck: failed to bind port ${port}: ${msg}`);
+  console.error(`is another cc-deck running? try: lsof -i :${port}`);
   process.exit(1);
 }
+const server = bunServer;
 
-// === stream line splitter ===
+console.error(
+  `cc-deck listening on http://${server.hostname}:${server.port}, workdir=${workdir}`,
+);
 
-async function* readLines(
-  stream: ReadableStream<Uint8Array>,
-): AsyncGenerator<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  const trimCR = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        // Flush any pending multi-byte sequence out of the decoder before
-        // the final yield, otherwise trailing non-ASCII chars can be lost.
-        buf += decoder.decode();
-        if (buf.length > 0) yield trimCR(buf);
-        return;
-      }
-      buf += decoder.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buf.indexOf("\n")) !== -1) {
-        // Strip trailing \r so CRLF-terminated lines don't break JSON.parse.
-        yield trimCR(buf.slice(0, idx));
-        buf = buf.slice(idx + 1);
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
+// === auto-create initial session ===
 
-// === pipe subprocess stdout → envelope events ===
-
-// Narrow past the null state; if spawn failed we'd have exited above.
-if (!proc) process.exit(1);
-const activeProc = proc;
-const procStdout = activeProc.stdout as ReadableStream<Uint8Array>;
-const procStderr = activeProc.stderr as ReadableStream<Uint8Array>;
-
-let shutdownSignalReceived = false;
-
-// If a detached pump fails (emit throws on disk/perm error, reader throws),
-// we'd rather shut down cleanly than leak an unhandled rejection.
-const fatalPumpError = (where: string) => (err: unknown) => {
+let initialSession: Session;
+try {
+  initialSession = await manager.create({ workdir });
+} catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
-  console.error(`cc-deck: ${where} failed: ${msg}`);
-  shutdownSignalReceived = true;
-  activeProc.kill();
-};
-
-(async () => {
-  for await (const line of readLines(procStdout)) {
-    if (!line.trim()) continue;
-    try {
-      const raw = JSON.parse(line);
-      const type = typeof raw?.type === "string" ? raw.type : "unknown";
-      await emit(type, raw);
-    } catch (err) {
-      await emit("subprocess_stdout_parse_error", {
-        line,
-        error: (err as Error).message,
-      });
-    }
-  }
-})().catch(fatalPumpError("stdout pump"));
-
-// === pipe subprocess stderr → subprocess_stderr envelope events ===
-
-(async () => {
-  for await (const line of readLines(procStderr)) {
-    await emit("subprocess_stderr", { line });
-  }
-})().catch(fatalPumpError("stderr pump"));
-
-// === subprocess exit → emit + shutdown ===
-
-(async () => {
-  const code = await activeProc.exited;
-  await emit("subprocess_exited", {
-    code,
-    reason: shutdownSignalReceived
-      ? "operator signal"
-      : code === 0
-        ? "clean"
-        : "error",
-  });
-  await jsonlWriter.end();
+  console.error(`cc-deck: failed to spawn initial CC subprocess: ${msg}`);
   server.stop();
-  process.exit(shutdownSignalReceived ? 0 : code === 0 ? 0 : 1);
-})().catch((err) => {
-  // Shutdown sequence itself failed. Nothing graceful left to do.
-  const msg = err instanceof Error ? err.message : String(err);
-  console.error(`cc-deck: shutdown handler failed: ${msg}`);
   process.exit(1);
-});
+}
+console.error(`cc-deck initial session ${initialSession.oakridgeSid}`);
 
-// === signal handlers: clean shutdown on Ctrl-C / systemctl stop ===
+// === signals ===
 
+let shuttingDown = false;
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
-    shutdownSignalReceived = true;
-    activeProc.kill();
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void (async () => {
+      const worstCode = await manager.endAll();
+      server.stop();
+      process.exit(worstCode);
+    })();
   });
 }
