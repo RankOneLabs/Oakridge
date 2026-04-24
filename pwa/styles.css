@@ -544,7 +544,10 @@ body {
   font-size: 0.8rem;
   font-weight: 600;
   cursor: pointer;
-  min-height: 36px;
+  /* Match the 44px touch target the rest of the UI uses (theme toggle,
+     yolo toggle, approve/deny, send). Padding stays tight so the button
+     still reads as a secondary inline action inside the row. */
+  min-height: 44px;
 }
 .btn-resume:hover:not(:disabled) {
   filter: brightness(1.08);

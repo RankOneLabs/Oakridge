@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SessionManager } from "./session-manager";
+import { SessionManager, type CreateSessionOpts } from "./session-manager";
 import {
   Session,
   SessionNotReadyError,
@@ -683,23 +683,27 @@ app.post("/sessions", async (c) => {
   // oakridgeSid whose parent CC session should be inherited as context
   // via --resume <parentCcSid> --fork-session.
   let resumeFrom: string | null = null;
-  // Hono's c.req.json() throws on empty body; accept that case as
-  // "no options" so old POST /sessions callers (no body) still work.
+  // Read raw text first so we can distinguish "no body" (treat as no
+  // options, preserves the old POST /sessions behavior) from "bad body"
+  // (400). Using c.req.json() with an inner .catch() would silently
+  // turn malformed JSON into "no options" — a bad body would create
+  // a fresh session instead of erroring.
   try {
-    const raw = (await c.req.json().catch(() => null)) as {
-      resume_from?: unknown;
-    } | null;
-    if (raw && raw.resume_from !== undefined) {
-      if (typeof raw.resume_from !== "string") {
-        return c.json({ error: "resume_from must be a string" }, 400);
+    const bodyText = await c.req.text();
+    if (bodyText !== "") {
+      const raw = JSON.parse(bodyText) as { resume_from?: unknown };
+      if (raw && raw.resume_from !== undefined) {
+        if (typeof raw.resume_from !== "string") {
+          return c.json({ error: "resume_from must be a string" }, 400);
+        }
+        resumeFrom = raw.resume_from;
       }
-      resumeFrom = raw.resume_from;
     }
   } catch {
     return c.json({ error: "invalid json" }, 400);
   }
 
-  let spawnOpts: { workdir: string; parentCcSid?: string; parentOakridgeSid?: string };
+  let spawnOpts: CreateSessionOpts;
   if (resumeFrom === null) {
     spawnOpts = { workdir };
   } else {
