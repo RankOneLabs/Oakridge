@@ -368,19 +368,12 @@ app.post("/:sid/approval", async (c) => {
 app.get("/sessions", (c) => c.json({ sessions: manager.listSnapshots() }));
 
 app.post("/sessions", async (c) => {
-  let body: { workdir?: unknown } = {};
+  // PR 1 doesn't expose a per-session workdir knob — every new session
+  // uses the server's --workdir. A future PR can add a validated workdir
+  // field (resolve + stat + probably loopback-only) once we actually need
+  // multi-workdir support.
   try {
-    const raw = await c.req.text();
-    body = raw ? (JSON.parse(raw) as { workdir?: unknown }) : {};
-  } catch {
-    return c.json({ error: "invalid json" }, 400);
-  }
-  const sessionWorkdir =
-    typeof body.workdir === "string" && body.workdir.length > 0
-      ? body.workdir
-      : workdir;
-  try {
-    const session = await manager.create({ workdir: sessionWorkdir });
+    const session = await manager.create({ workdir });
     return c.json(session.snapshot());
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

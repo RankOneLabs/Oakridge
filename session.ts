@@ -99,6 +99,11 @@ export class Session {
   private yoloMode = false;
   private allowedTools = new Set<string>();
   private exitPromise: Promise<number> | null = null;
+  // Tracks the in-flight spawn so an abort() that arrives during the
+  // starting window (between manager.sessions.set() and spawn() finishing
+  // wiring the pumps + exitPromise) can wait for wiring to complete
+  // instead of racing finalize() against still-running spawn code.
+  private _spawnPromise: Promise<void> | null = null;
 
   constructor(opts: SessionOpts) {
     this.oakridgeSid = opts.oakridgeSid;
@@ -137,6 +142,16 @@ export class Session {
   }
 
   async emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
+    if (this._status === "ended") {
+      // A /hook/approval handler can still try to emit permission_resolved
+      // after the subprocess dies mid-decision; finalize() flipped status
+      // to "ended" and closed (or is about to close) the writer. Log and
+      // return a sentinel instead of queueing work onto a doomed writer.
+      console.error(
+        `cc-deck: dropping emit(${type}) on ended session ${this.oakridgeSid}`,
+      );
+      return { id: -1, type, ts: new Date().toISOString(), payload };
+    }
     // Id assignment is synchronous (no await before `this.nextId++`), so
     // ids are monotonic in invocation order regardless of how many callers
     // race into emit. The queue below then preserves that same order for
@@ -180,6 +195,15 @@ export class Session {
   }
 
   async spawn(cmd: SpawnCmd): Promise<void> {
+    if (this._spawnPromise) return this._spawnPromise;
+    // Capture the promise synchronously (no await before this assignment
+    // in the caller sequence) so a concurrent abort() can reliably find
+    // it via the sync prefix of this call.
+    this._spawnPromise = this._runSpawn(cmd);
+    return this._spawnPromise;
+  }
+
+  private async _runSpawn(cmd: SpawnCmd): Promise<void> {
     await this.emit("session_started", {
       command: cmd.cmd,
       workdir: this.workdir,
@@ -299,6 +323,12 @@ export class Session {
   }
 
   private async finalize(): Promise<void> {
+    // Idempotent: abort() and the exitPromise's finally can both race into
+    // finalize; the first one wins and the second is a no-op.
+    if (this._status === "ended") return;
+    // Flip status BEFORE draining so any emit() racing with finalize sees
+    // the ended flag and short-circuits instead of queueing new writes
+    // onto a writer we're about to close.
     this._status = "ended";
     // Reject any still-parked approvals so the gate's curl calls don't hang
     // indefinitely on a dead subprocess.
@@ -310,6 +340,18 @@ export class Session {
       }
     }
     this.pendingApprovals.clear();
+    // Drain in-flight emit work (write+flush+fanout) before closing the
+    // writer — otherwise queued tasks that were accepted before the status
+    // flip would hit an ended writer.
+    try {
+      await this.emitQueue;
+    } catch (err) {
+      console.error(
+        `cc-deck: emit queue drain failed for ${this.oakridgeSid}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     try {
       await this.jsonlWriter.end();
     } catch (err) {
@@ -408,10 +450,29 @@ export class Session {
   }
 
   async abort(): Promise<number> {
-    if (this._status === "ended") {
-      return this.exitPromise ? await this.exitPromise : 0;
-    }
     this.shutdownSignalReceived = true;
+    // Wait for spawn to finish wiring (or fail). Without this, an abort
+    // arriving in the "starting" window could finalize() the session
+    // while _runSpawn() is still mid-way through wiring pumps, producing
+    // write-after-end on the jsonl writer.
+    if (this._spawnPromise) {
+      try {
+        await this._spawnPromise;
+      } catch {
+        // Spawn failed and finalize() already ran; fall through to the
+        // ended-state handling below.
+      }
+    }
+    if (this._status === "ended") {
+      if (this.exitPromise) {
+        try {
+          return await this.exitPromise;
+        } catch {
+          return 1;
+        }
+      }
+      return 0;
+    }
     if (this.proc) {
       try {
         this.proc.kill();
@@ -426,7 +487,8 @@ export class Session {
         return 1;
       }
     }
-    // spawn failed before exit promise was wired up
+    // No exit promise wired (spawn was never called or Session was used
+    // outside the manager); finalize synchronously to clean up.
     await this.finalize();
     return 1;
   }
