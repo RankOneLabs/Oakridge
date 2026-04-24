@@ -768,9 +768,17 @@ async function resolveResumeParent(sid: string): Promise<ResumeParentResult> {
   let contents: string;
   try {
     contents = await readJsonlOrEmpty(jsonlPath);
-  } catch {
+  } catch (err) {
     // Same EACCES / I/O error surface as loadArchivedSnapshot — treat
-    // as unknown rather than 500 the resume call.
+    // as unknown rather than 500 the resume call, but log the cause so
+    // an operator seeing an unexpected 404 on resume has a breadcrumb
+    // (the alternative is indistinguishable from a genuinely unknown
+    // sid).
+    console.error(
+      `cc-deck: failed to read parent jsonl ${jsonlPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
     return { kind: "unknown" };
   }
   if (!contents) return { kind: "unknown" };
