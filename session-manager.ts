@@ -3,9 +3,11 @@ import { join } from "node:path";
 
 import {
   Session,
+  extractResultUsage,
   newSessionId,
   readJsonlOrEmpty,
   type EnvelopeEvent,
+  type ResultUsage,
   type SessionSnapshot,
   type SessionStatus,
   type SpawnCmd,
@@ -344,6 +346,7 @@ async function loadArchivedSnapshot(
   let lastActivityTs = "";
   const allowedTools = new Set<string>();
   let yoloMode = false;
+  let lastResultUsage: ResultUsage | null = null;
   for (const line of contents.split("\n")) {
     if (!line.trim()) continue;
     let evt: EnvelopeEvent;
@@ -382,6 +385,11 @@ async function loadArchivedSnapshot(
         if (typeof payload.enabled === "boolean") yoloMode = payload.enabled;
         break;
       }
+      case "result": {
+        const usage = extractResultUsage(payload);
+        if (usage) lastResultUsage = usage;
+        break;
+      }
     }
   }
   if (!createdAt) return null;
@@ -402,5 +410,6 @@ async function loadArchivedSnapshot(
     pendingCount: 0,
     yoloMode,
     allowedTools: [...allowedTools],
+    lastResultUsage,
   };
 }

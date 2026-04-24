@@ -45,6 +45,19 @@ export interface SessionOpts {
 
 export type SessionStatus = "starting" | "live" | "ended";
 
+/**
+ * Subset of CC's `result`-event usage block. Captured on every `result`
+ * emit and snapshotted so the PWA can show a rough token footprint on
+ * the Resume button — important on Claude Max where a resume re-ingests
+ * parent context and burns against the 5-hour rate-limit window.
+ */
+export interface ResultUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
 export interface SessionSnapshot {
   sid: string;
   workdir: string;
@@ -57,6 +70,7 @@ export interface SessionSnapshot {
   pendingCount: number;
   yoloMode: boolean;
   allowedTools: string[];
+  lastResultUsage: ResultUsage | null;
 }
 
 export async function readJsonlOrEmpty(path: string): Promise<string> {
@@ -102,6 +116,7 @@ export class Session {
   private lastActivityTs: string;
   private yoloMode = false;
   private allowedTools = new Set<string>();
+  private lastResultUsage: ResultUsage | null = null;
   private exitPromise: Promise<number> | null = null;
   // Tracks the in-flight spawn so an abort() that arrives during the
   // starting window (between manager.sessions.set() and spawn() finishing
@@ -163,6 +178,7 @@ export class Session {
       pendingCount: this.pendingApprovals.size,
       yoloMode: this.yoloMode,
       allowedTools: [...this.allowedTools],
+      lastResultUsage: this.lastResultUsage,
     };
   }
 
@@ -196,6 +212,14 @@ export class Session {
           e instanceof Error ? e.message : String(e)
         }`,
       );
+    }
+    // Capture the usage block off CC's result events so the PWA can
+    // surface a rough parent-context size on the Resume button. Each new
+    // result overwrites the prior one — the most recent usage is what
+    // matters for "how much will a resume cost."
+    if (type === "result") {
+      const usage = extractResultUsage(payload);
+      if (usage) this.lastResultUsage = usage;
     }
     const task = async () => {
       this.jsonlWriter.write(JSON.stringify(evt) + "\n");
@@ -620,6 +644,27 @@ export class SessionNotReadyError extends Error {
     super("subprocess not ready");
     this.name = "SessionNotReadyError";
   }
+}
+
+export function extractResultUsage(payload: unknown): ResultUsage | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const usage = (payload as { usage?: unknown }).usage;
+  if (typeof usage !== "object" || usage === null) return null;
+  const u = usage as Record<string, unknown>;
+  const input = typeof u.input_tokens === "number" ? u.input_tokens : null;
+  const output = typeof u.output_tokens === "number" ? u.output_tokens : null;
+  if (input === null || output === null) return null;
+  const result: ResultUsage = {
+    input_tokens: input,
+    output_tokens: output,
+  };
+  if (typeof u.cache_creation_input_tokens === "number") {
+    result.cache_creation_input_tokens = u.cache_creation_input_tokens;
+  }
+  if (typeof u.cache_read_input_tokens === "number") {
+    result.cache_read_input_tokens = u.cache_read_input_tokens;
+  }
+  return result;
 }
 
 export function newSessionId(): string {
