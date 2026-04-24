@@ -18,6 +18,13 @@ export interface EnvelopeEvent {
 
 type SessionStatus = "starting" | "live" | "ended";
 
+interface ResultUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
 interface SessionSnapshot {
   sid: string;
   workdir: string;
@@ -30,6 +37,7 @@ interface SessionSnapshot {
   pendingCount: number;
   yoloMode: boolean;
   allowedTools: string[];
+  lastResultUsage: ResultUsage | null;
 }
 
 type InboxDelta =
@@ -300,21 +308,28 @@ function SessionListView({
   onSelect: (sid: string) => void;
   onHydrateSession: (snapshot: SessionSnapshot) => void;
 }) {
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  const [pendingError, setPendingError] = useState<string | null>(null);
   const sorted = useMemo(() => sortSessions(sessions), [sessions]);
 
-  async function createSession() {
-    if (creating) return;
-    setCreating(true);
-    setCreateError(null);
+  // Shared POST /sessions path for both the "+ New session" button and
+  // row-level Resume buttons. A resume request passes resume_from;
+  // undefined body kicks off a fresh session.
+  async function startSession(resumeFrom?: string) {
+    if (pending) return;
+    setPending(true);
+    setPendingError(null);
     try {
-      const res = await fetch("/sessions", { method: "POST" });
+      const res = await fetch("/sessions", {
+        method: "POST",
+        headers: resumeFrom ? { "content-type": "application/json" } : undefined,
+        body: resumeFrom ? JSON.stringify({ resume_from: resumeFrom }) : undefined,
+      });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as {
           error?: unknown;
         } | null;
-        setCreateError(
+        setPendingError(
           typeof body?.error === "string"
             ? body.error
             : `server returned ${res.status}`,
@@ -329,9 +344,9 @@ function SessionListView({
       onHydrateSession(snap);
       onSelect(snap.sid);
     } catch (err) {
-      setCreateError(err instanceof Error ? err.message : "network error");
+      setPendingError(err instanceof Error ? err.message : "network error");
     } finally {
-      setCreating(false);
+      setPending(false);
     }
   }
 
@@ -358,14 +373,14 @@ function SessionListView({
         <button
           type="button"
           className="btn-new-session"
-          onClick={() => void createSession()}
-          disabled={creating}
+          onClick={() => void startSession()}
+          disabled={pending}
         >
-          {creating ? "starting…" : "+ New session"}
+          {pending ? "starting…" : "+ New session"}
         </button>
-        {createError && (
+        {pendingError && (
           <div className="input-error" role="alert">
-            error: {createError}
+            error: {pendingError}
           </div>
         )}
       </div>
@@ -377,7 +392,9 @@ function SessionListView({
             <SessionRow
               key={s.sid}
               snapshot={s}
-              onClick={() => onSelect(s.sid)}
+              onOpen={() => onSelect(s.sid)}
+              onResume={() => void startSession(s.sid)}
+              resumeDisabled={pending}
             />
           ))}
         </ul>
@@ -398,18 +415,23 @@ function sortSessions(sessions: Map<string, SessionSnapshot>): SessionSnapshot[]
 
 function SessionRow({
   snapshot,
-  onClick,
+  onOpen,
+  onResume,
+  resumeDisabled,
 }: {
   snapshot: SessionSnapshot;
-  onClick: () => void;
+  onOpen: () => void;
+  onResume: () => void;
+  resumeDisabled: boolean;
 }) {
   const relative = useRelativeTime(snapshot.lastActivityTs);
+  const canResume = snapshot.status === "ended";
   return (
-    <li>
+    <li className="session-row-li">
       <button
         type="button"
         className={`session-row session-row-${snapshot.status}`}
-        onClick={onClick}
+        onClick={onOpen}
       >
         <div className="session-row-line">
           <span className={`session-row-status session-row-status-${snapshot.status}`}>
@@ -432,8 +454,48 @@ function SessionRow({
           {snapshot.workdir}
         </div>
       </button>
+      {canResume && (
+        <button
+          type="button"
+          className="btn-resume"
+          disabled={resumeDisabled}
+          title={resumeTitle(snapshot.lastResultUsage)}
+          onClick={(e) => {
+            // Don't also trigger the row's open-transcript click behind us.
+            e.stopPropagation();
+            onResume();
+          }}
+        >
+          Resume
+        </button>
+      )}
     </li>
   );
+}
+
+function resumeTitle(usage: ResultUsage | null): string {
+  if (!usage) {
+    return "Start a new session inheriting this one's context.";
+  }
+  // Cache reads are ~free; cache_creation is what a resume re-ingests as
+  // new context on Claude Max, so include it in the rough "cost" number.
+  // This is a ballpark — CC's internal tokenization + prompt scaffolding
+  // add overhead we can't see from the result event alone.
+  const rough =
+    usage.input_tokens +
+    (usage.cache_creation_input_tokens ?? 0) +
+    usage.output_tokens;
+  return (
+    `Start a new session inheriting this one's context.\n` +
+    `~${formatTokens(rough)} parent context — ` +
+    `on Claude Max this burns against the 5-hour rate-limit window, not dollars.`
+  );
+}
+
+function formatTokens(n: number): string {
+  if (n < 1000) return `${n} tokens`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k tokens`;
+  return `${(n / 1_000_000).toFixed(1)}M tokens`;
 }
 
 function useRelativeTime(iso: string): string {

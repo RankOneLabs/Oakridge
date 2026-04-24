@@ -20,12 +20,6 @@ export default defineConfig({
         target: backendTarget,
         changeOrigin: true,
       },
-      // Legacy single-session aliases kept for the PR 2.5 cutover window.
-      "/stream": { target: backendTarget, changeOrigin: true },
-      "/events": backendTarget,
-      "/input": backendTarget,
-      "/approval": backendTarget,
-      "/yolo": backendTarget,
     },
   },
   build: {

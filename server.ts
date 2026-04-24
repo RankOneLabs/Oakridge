@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SessionManager } from "./session-manager";
+import { SessionManager, type CreateSessionOpts } from "./session-manager";
 import {
   Session,
   SessionNotReadyError,
@@ -678,12 +678,67 @@ app.get("/inbox", (c) => {
 });
 
 app.post("/sessions", async (c) => {
-  // PR 1 doesn't expose a per-session workdir knob — every new session
-  // uses the server's --workdir. A future PR can add a validated workdir
-  // field (resolve + stat + probably loopback-only) once we actually need
-  // multi-workdir support.
+  // Optional body: { resume_from?: string }. No body / missing field =
+  // a fresh session from scratch (unchanged from PR 2). resume_from is an
+  // oakridgeSid whose parent CC session should be inherited as context
+  // via --resume <parentCcSid> --fork-session.
+  let resumeFrom: string | null = null;
+  // Read raw text first so we can distinguish "no body" (treat as no
+  // options, preserves the old POST /sessions behavior) from "bad body"
+  // (400). Using c.req.json() with an inner .catch() would silently
+  // turn malformed JSON into "no options" — a bad body would create
+  // a fresh session instead of erroring.
   try {
-    const session = await manager.create({ workdir });
+    const bodyText = await c.req.text();
+    if (bodyText !== "") {
+      const raw = JSON.parse(bodyText) as { resume_from?: unknown };
+      if (raw && raw.resume_from !== undefined) {
+        if (typeof raw.resume_from !== "string") {
+          return c.json({ error: "resume_from must be a string" }, 400);
+        }
+        resumeFrom = raw.resume_from;
+      }
+    }
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+
+  let spawnOpts: CreateSessionOpts;
+  if (resumeFrom === null) {
+    spawnOpts = { workdir };
+  } else {
+    if (!isValidSid(resumeFrom)) {
+      return c.json({ error: "invalid resume_from" }, 400);
+    }
+    const parentInfo = await resolveResumeParent(resumeFrom);
+    if (parentInfo.kind === "unknown") {
+      return c.json({ error: "unknown resume_from session" }, 404);
+    }
+    if (parentInfo.kind === "no_cc_sid") {
+      // Parent session never reached CC's system/init — there's nothing
+      // to resume against. Distinct 400 so the PWA can show a specific
+      // error rather than "spawn failed".
+      return c.json(
+        {
+          error:
+            "resume_from parent never observed a cc session id — can't resume",
+        },
+        400,
+      );
+    }
+    spawnOpts = {
+      // Spawn under the parent's workdir, not the server default. If the
+      // operator restarted the server with a different --workdir, the
+      // resumed subprocess still needs parent's cwd to match what the
+      // transcript assumes.
+      workdir: parentInfo.workdir,
+      parentCcSid: parentInfo.parentCcSid,
+      parentOakridgeSid: resumeFrom,
+    };
+  }
+
+  try {
+    const session = await manager.create(spawnOpts);
     return c.json(session.snapshot());
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -691,75 +746,81 @@ app.post("/sessions", async (c) => {
   }
 });
 
+/**
+ * Look up a resume parent's ccSid + workdir. Checks the live map first
+ * (fast path) then falls back to parsing the on-disk JSONL. Returns a
+ * tagged result so the POST handler can map each failure case to a
+ * distinct status code.
+ */
+type ResumeParentResult =
+  | { kind: "unknown" }
+  | { kind: "no_cc_sid" }
+  | { kind: "ok"; parentCcSid: string; workdir: string };
+
+async function resolveResumeParent(sid: string): Promise<ResumeParentResult> {
+  const live = manager.get(sid);
+  if (live) {
+    const ccSid = live.currentCcSid;
+    if (!ccSid) return { kind: "no_cc_sid" };
+    return { kind: "ok", parentCcSid: ccSid, workdir: live.workdir };
+  }
+  const jsonlPath = join(sessionsDir, `${sid}.jsonl`);
+  let contents: string;
+  try {
+    contents = await readJsonlOrEmpty(jsonlPath);
+  } catch (err) {
+    // Same EACCES / I/O error surface as loadArchivedSnapshot — treat
+    // as unknown rather than 500 the resume call, but log the cause so
+    // an operator seeing an unexpected 404 on resume has a breadcrumb
+    // (the alternative is indistinguishable from a genuinely unknown
+    // sid).
+    console.error(
+      `cc-deck: failed to read parent jsonl ${jsonlPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return { kind: "unknown" };
+  }
+  if (!contents) return { kind: "unknown" };
+  let parentCcSid: string | null = null;
+  let parentWorkdir: string | null = null;
+  for (const line of contents.split("\n")) {
+    if (!line.trim()) continue;
+    let evt: EnvelopeEvent;
+    try {
+      evt = JSON.parse(line) as EnvelopeEvent;
+    } catch {
+      continue;
+    }
+    const payload = (evt.payload ?? {}) as Record<string, unknown>;
+    if (
+      evt.type === "cc_session_id_observed" &&
+      typeof payload.cc_session_id === "string"
+    ) {
+      parentCcSid = payload.cc_session_id;
+    }
+    if (evt.type === "session_started" && typeof payload.workdir === "string") {
+      parentWorkdir = payload.workdir;
+    }
+    if (parentCcSid && parentWorkdir) break;
+  }
+  if (!parentCcSid) return { kind: "no_cc_sid" };
+  // Fall back to server --workdir if the parent's session_started frame
+  // is missing a workdir (very early truncated transcript). Same cwd
+  // the operator is running under now; best-effort.
+  return {
+    kind: "ok",
+    parentCcSid,
+    workdir: parentWorkdir ?? workdir,
+  };
+}
+
 app.delete("/sessions/:sid", async (c) => {
   const sid = c.req.param("sid");
   const session = manager.get(sid);
   if (!session) return c.json({ error: "unknown session" }, 404);
   const code = await session.abort();
   return c.json({ ok: true, code });
-});
-
-// ---- legacy aliases (temporary bridge so today's PWA keeps working) ----
-
-function requireSingleLive(
-  c: Context,
-): Session | Response {
-  const session = manager.getSingleLive();
-  if (!session) {
-    return c.json(
-      {
-        error:
-          "no single live session — use /:sid/<route> for multi-session clients",
-      },
-      409,
-    );
-  }
-  return session;
-}
-
-app.get("/stream", (c) => {
-  const s = requireSingleLive(c);
-  if (!(s instanceof Session)) return s;
-  return streamForSession(s, c);
-});
-
-app.get("/events", async (c) => {
-  const s = requireSingleLive(c);
-  if (!(s instanceof Session)) return s;
-  return eventsForSession(s, c);
-});
-
-app.post("/input", async (c) => {
-  const s = requireSingleLive(c);
-  if (!(s instanceof Session)) return s;
-  return inputForSession(s, c);
-});
-
-app.post("/yolo", async (c) => {
-  const s = requireSingleLive(c);
-  if (!(s instanceof Session)) return s;
-  return yoloForSession(s, c);
-});
-
-app.post("/approval", async (c) => {
-  // Legacy /approval body doesn't carry a sid. Scan live sessions by
-  // request_id (UUIDs, globally unique). Keeps today's PWA working until
-  // it migrates to /:sid/approval in PR 2.
-  let raw: unknown;
-  try {
-    raw = await c.req.json();
-  } catch {
-    return c.json({ error: "invalid json" }, 400);
-  }
-  const parsed = parseApprovalBody(raw);
-  if (typeof parsed === "string") return c.json({ error: parsed }, 400);
-  const owningSession = manager
-    .listLive()
-    .find((s) => s.hasApproval(parsed.request_id));
-  if (!owningSession) {
-    return c.json({ error: "unknown or already-resolved request_id" }, 404);
-  }
-  return applyApproval(owningSession, parsed, c);
 });
 
 // ---- static PWA ----

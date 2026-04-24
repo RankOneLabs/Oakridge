@@ -520,6 +520,42 @@ body {
   flex-direction: column;
   gap: 0.4rem;
 }
+.session-row-li {
+  position: relative;
+}
+/* Make room on the right side of the row so the Resume button can sit
+   absolutely-positioned without overlapping the workdir text. The
+   absolute-positioning keeps the button out of the row's click target
+   while still visually attached to the row. */
+.session-row-li:has(.btn-resume) .session-row {
+  padding-right: 5.5rem;
+}
+.btn-resume {
+  position: absolute;
+  top: 50%;
+  right: 0.75rem;
+  transform: translateY(-50%);
+  background: var(--accent-blue);
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 0.4rem 0.75rem;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  /* Match the 44px touch target the rest of the UI uses (theme toggle,
+     yolo toggle, approve/deny, send). Padding stays tight so the button
+     still reads as a secondary inline action inside the row. */
+  min-height: 44px;
+}
+.btn-resume:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.btn-resume:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .session-list-empty {
   text-align: center;
   color: var(--text-muted);
