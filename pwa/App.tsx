@@ -555,7 +555,7 @@ function SessionView({
         resolutions={resolutions}
         allowedTools={allowedTools}
         sid={sid}
-        canApprove={canInput}
+        sessionStatus={snapshot?.status ?? null}
       />
       {canInput && <InputBox sid={sid} />}
       {!canInput && snapshot?.status === "ended" && (
@@ -683,13 +683,13 @@ function EventList({
   resolutions,
   allowedTools,
   sid,
-  canApprove,
+  sessionStatus,
 }: {
   events: EnvelopeEvent[];
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
   sid: string;
-  canApprove: boolean;
+  sessionStatus: SessionStatus | null;
 }) {
   return (
     <div className="events">
@@ -700,7 +700,7 @@ function EventList({
           resolutions={resolutions}
           allowedTools={allowedTools}
           sid={sid}
-          canApprove={canApprove}
+          sessionStatus={sessionStatus}
         />
       ))}
     </div>
@@ -712,13 +712,13 @@ function EventRow({
   resolutions,
   allowedTools,
   sid,
-  canApprove,
+  sessionStatus,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
   sid: string;
-  canApprove: boolean;
+  sessionStatus: SessionStatus | null;
 }) {
   switch (event.type) {
     case "user":
@@ -732,7 +732,7 @@ function EventRow({
           resolutions={resolutions}
           allowedTools={allowedTools}
           sid={sid}
-          canApprove={canApprove}
+          sessionStatus={sessionStatus}
         />
       );
     case "permission_resolved":
@@ -904,13 +904,13 @@ function PermissionRow({
   resolutions,
   allowedTools,
   sid,
-  canApprove,
+  sessionStatus,
 }: {
   event: EnvelopeEvent;
   resolutions: ResolutionMap;
   allowedTools: Set<string>;
   sid: string;
-  canApprove: boolean;
+  sessionStatus: SessionStatus | null;
 }) {
   const p = event.payload as PermissionRequestPayload;
   const resolution = resolutions.get(p.request_id);
@@ -927,12 +927,13 @@ function PermissionRow({
     );
   }
 
-  // An unresolved permission_request on a non-live session means either
-  // finalize's terminal deny never made it to the JSONL (server crash)
-  // or the session ended between render and action. Either way the
-  // approval endpoint would 404/409 — collapse the card to a muted
-  // read-only notice so the operator doesn't tap a button that can't act.
-  if (!canApprove) {
+  // Only collapse to a read-only notice when the session is definitively
+  // ended. For "starting" or a still-loading inbox snapshot (null), fall
+  // through to the normal buttons — realistic case is a brief window where
+  // the inbox hasn't delivered the snapshot yet, and the server will
+  // 404/503 if the operator taps before it's ready. "session ended"
+  // messaging is wrong for those cases.
+  if (sessionStatus === "ended") {
     return (
       <div className="row row-system">
         <div className="notice notice-muted">

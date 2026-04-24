@@ -187,15 +187,20 @@ async function streamForSession(session: Session, c: Context) {
       }
       // Drain any events that arrived between the last pending.shift() and
       // the abort so clients don't miss the final subprocess_exited frame.
-      while (pending.length > 0) {
-        const evt = pending.shift()!;
-        if (evt.id <= sentUpTo) continue;
-        sentUpTo = evt.id;
-        await stream.writeSSE({
-          event: "message",
-          data: JSON.stringify(evt),
-          id: String(evt.id),
-        });
+      // Only drain when the session ended but the client is still connected —
+      // if the client aborted, writing to the dead socket would just throw,
+      // and there's no one to miss the frame anyway.
+      if (endedSignal.aborted && !clientSignal.aborted) {
+        while (pending.length > 0) {
+          const evt = pending.shift()!;
+          if (evt.id <= sentUpTo) continue;
+          sentUpTo = evt.id;
+          await stream.writeSSE({
+            event: "message",
+            data: JSON.stringify(evt),
+            id: String(evt.id),
+          });
+        }
       }
     } finally {
       clearInterval(heartbeat);
@@ -219,8 +224,11 @@ async function eventsForSession(session: Session, c: Context) {
   });
 }
 
+// UUID v4 specifically — sids come from crypto.randomUUID(), which always
+// produces v4. Accepting other versions would be dead space that never
+// matches any real sid the server wrote.
 const SID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isValidSid(sid: string): boolean {
   return SID_PATTERN.test(sid);
