@@ -337,65 +337,10 @@ interface HookInput {
 
 const app = new Hono();
 
-// ---- per-sid routes ----
-
-app.get("/:sid/stream", (c) => {
-  const session = manager.get(c.req.param("sid"));
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  return streamForSession(session, c);
-});
-
-app.get("/:sid/events", async (c) => {
-  const session = manager.get(c.req.param("sid"));
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  return eventsForSession(session, c);
-});
-
-app.post("/:sid/input", async (c) => {
-  const session = manager.get(c.req.param("sid"));
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  return inputForSession(session, c);
-});
-
-app.post("/:sid/yolo", async (c) => {
-  const session = manager.get(c.req.param("sid"));
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  return yoloForSession(session, c);
-});
-
-app.post("/:sid/approval", async (c) => {
-  const session = manager.get(c.req.param("sid"));
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  return approvalForSession(session, c);
-});
-
-// ---- sessions CRUD ----
-
-app.get("/sessions", (c) => c.json({ sessions: manager.listSnapshots() }));
-
-app.post("/sessions", async (c) => {
-  // PR 1 doesn't expose a per-session workdir knob — every new session
-  // uses the server's --workdir. A future PR can add a validated workdir
-  // field (resolve + stat + probably loopback-only) once we actually need
-  // multi-workdir support.
-  try {
-    const session = await manager.create({ workdir });
-    return c.json(session.snapshot());
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return c.json({ error: `spawn failed: ${msg}` }, 500);
-  }
-});
-
-app.delete("/sessions/:sid", async (c) => {
-  const sid = c.req.param("sid");
-  const session = manager.get(sid);
-  if (!session) return c.json({ error: "unknown session" }, 404);
-  const code = await session.abort();
-  return c.json({ ok: true, code });
-});
-
 // ---- hook (loopback-only) ----
+//
+// Registered BEFORE /:sid/* so Hono's registration-order match doesn't
+// catch POST /hook/approval as /:sid/approval with sid="hook".
 
 app.post("/hook/approval", async (c) => {
   if (!bunServer) return c.text("server not ready", 503);
@@ -555,6 +500,64 @@ async function resolveSessionForHook(
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+// ---- per-sid routes ----
+
+app.get("/:sid/stream", (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return streamForSession(session, c);
+});
+
+app.get("/:sid/events", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return eventsForSession(session, c);
+});
+
+app.post("/:sid/input", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return inputForSession(session, c);
+});
+
+app.post("/:sid/yolo", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return yoloForSession(session, c);
+});
+
+app.post("/:sid/approval", async (c) => {
+  const session = manager.get(c.req.param("sid"));
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  return approvalForSession(session, c);
+});
+
+// ---- sessions CRUD ----
+
+app.get("/sessions", (c) => c.json({ sessions: manager.listSnapshots() }));
+
+app.post("/sessions", async (c) => {
+  // PR 1 doesn't expose a per-session workdir knob — every new session
+  // uses the server's --workdir. A future PR can add a validated workdir
+  // field (resolve + stat + probably loopback-only) once we actually need
+  // multi-workdir support.
+  try {
+    const session = await manager.create({ workdir });
+    return c.json(session.snapshot());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `spawn failed: ${msg}` }, 500);
+  }
+});
+
+app.delete("/sessions/:sid", async (c) => {
+  const sid = c.req.param("sid");
+  const session = manager.get(sid);
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  const code = await session.abort();
+  return c.json({ ok: true, code });
+});
 
 // ---- legacy aliases (temporary bridge so today's PWA keeps working) ----
 
