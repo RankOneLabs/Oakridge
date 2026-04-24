@@ -441,12 +441,24 @@ app.post("/hook/approval", async (c) => {
       ? "allowlist"
       : null;
   if (autoReason) {
-    await session.emit("permission_auto_approved", {
-      tool_name: hook.tool_name,
-      tool_input: hook.tool_input,
-      tool_use_id: hook.tool_use_id,
-      reason: autoReason,
-    });
+    // Log the auto-approve best-effort. If emit throws (disk full, perm
+    // error), still return the allow decision — the auto-approve policy
+    // doesn't depend on the log being durable, and wedging CC on a log
+    // failure would be worse than a missing event line.
+    try {
+      await session.emit("permission_auto_approved", {
+        tool_name: hook.tool_name,
+        tool_input: hook.tool_input,
+        tool_use_id: hook.tool_use_id,
+        reason: autoReason,
+      });
+    } catch (err) {
+      console.error(
+        `cc-deck: failed to log auto-approve for ${hook.tool_name}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     return c.json({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -600,7 +612,7 @@ app.post("/approval", async (c) => {
   const parsed = parseApprovalBody(raw);
   if (typeof parsed === "string") return c.json({ error: parsed }, 400);
   const owningSession = manager
-    .list()
+    .listLive()
     .find((s) => s.hasApproval(parsed.request_id));
   if (!owningSession) {
     return c.json({ error: "unknown or already-resolved request_id" }, 404);

@@ -57,17 +57,12 @@ export class SessionManager {
       },
     });
     // Register in the live map before spawn so /hook/approval can find the
-    // session as soon as system/init arrives. If spawn throws, we remove it.
+    // session as soon as system/init arrives. If spawn throws, we keep it
+    // in the map (as ended) so a client that POSTed /sessions can still
+    // read the failure via /:sid/events. Reaping of ended sessions is a
+    // future PR; for now they accumulate, bounded by server lifetime.
     this.sessions.set(session.oakridgeSid, session);
-    try {
-      await session.spawn(this.opts.buildSpawnCmd(session));
-    } catch (err) {
-      // Keep the ended session in the map briefly so clients that POSTed /sessions
-      // and want to read the failure via /:sid/events can still do so. A future
-      // PR can add explicit reaping of ended sessions; for now they accumulate
-      // in memory over the server's lifetime, which is bounded.
-      throw err;
-    }
+    await session.spawn(this.opts.buildSpawnCmd(session));
     return session;
   }
 
@@ -82,6 +77,16 @@ export class SessionManager {
 
   list(): Session[] {
     return [...this.sessions.values()];
+  }
+
+  /**
+   * Live sessions only. Ended sessions linger in the map so clients can
+   * still read archived events via /:sid/events, but callers that only
+   * care about actionable state (pending approvals, input routing) want
+   * this filtered view.
+   */
+  listLive(): Session[] {
+    return [...this.sessions.values()].filter((s) => s.status === "live");
   }
 
   listSnapshots(): SessionSnapshot[] {
@@ -117,12 +122,12 @@ export class SessionManager {
   /**
    * Aborts every live session and awaits each one's finalize path
    * (jsonlWriter.end, subprocess_exited emit, ended callback). Returns the
-   * worst non-zero exit code across all sessions, or 0 if all exited cleanly.
+   * highest exit code across all sessions, or 0 if all exited cleanly.
    */
   async endAll(): Promise<number> {
     const exits = await Promise.all(
       [...this.sessions.values()].map((s) => s.abort().catch(() => 1)),
     );
-    return exits.reduce((worst, c) => (c !== 0 ? c : worst), 0);
+    return Math.max(0, ...exits);
   }
 }

@@ -85,6 +85,12 @@ export class Session {
   private subscribers = new Set<Subscriber>();
   private pendingApprovals = new Map<string, PendingApproval>();
   private inputQueue: Promise<unknown> = Promise.resolve();
+  // Serialize write+flush+fanout for every emit so concurrent callers
+  // (stdout pump, stderr pump, /hook/approval, /yolo, etc.) can't race on
+  // jsonlWriter.flush() resolution order and deliver subscriber frames
+  // out of id sequence — SSE's sentUpTo dedup would permanently drop the
+  // one that lost the race.
+  private emitQueue: Promise<unknown> = Promise.resolve();
   private proc: ReturnType<typeof Bun.spawn> | null = null;
   private ccSid: string | null = null;
   private _status: SessionStatus = "starting";
@@ -131,6 +137,10 @@ export class Session {
   }
 
   async emit(type: string, payload: unknown): Promise<EnvelopeEvent> {
+    // Id assignment is synchronous (no await before `this.nextId++`), so
+    // ids are monotonic in invocation order regardless of how many callers
+    // race into emit. The queue below then preserves that same order for
+    // the jsonl write and subscriber fan-out.
     const evt: EnvelopeEvent = {
       id: this.nextId++,
       type,
@@ -138,20 +148,25 @@ export class Session {
       payload,
     };
     this.lastActivityTs = evt.ts;
-    this.jsonlWriter.write(JSON.stringify(evt) + "\n");
-    await this.jsonlWriter.flush();
-    for (const cb of this.subscribers) {
-      try {
-        cb(evt);
-      } catch {
-        // one subscriber's failure shouldn't affect others
+    const task = async () => {
+      this.jsonlWriter.write(JSON.stringify(evt) + "\n");
+      await this.jsonlWriter.flush();
+      for (const cb of this.subscribers) {
+        try {
+          cb(evt);
+        } catch {
+          // one subscriber's failure shouldn't affect others
+        }
       }
-    }
-    try {
-      this.callbacks.onEmit?.(this, evt);
-    } catch {
-      // a badly-behaved manager hook mustn't corrupt per-session state
-    }
+      try {
+        this.callbacks.onEmit?.(this, evt);
+      } catch {
+        // a badly-behaved manager hook mustn't corrupt per-session state
+      }
+    };
+    const next = this.emitQueue.then(task, task);
+    this.emitQueue = next;
+    await next;
     return evt;
   }
 
@@ -257,15 +272,21 @@ export class Session {
 
     this.exitPromise = (async () => {
       const code = await activeProc.exited;
-      await this.emit("subprocess_exited", {
-        code,
-        reason: this.shutdownSignalReceived
-          ? "operator signal"
-          : code === 0
-            ? "clean"
-            : "error",
-      });
-      await this.finalize();
+      // finalize() must run even if the exit emit throws (disk full, perm
+      // error), otherwise pending approvals stay parked and the jsonl
+      // writer is never ended.
+      try {
+        await this.emit("subprocess_exited", {
+          code,
+          reason: this.shutdownSignalReceived
+            ? "operator signal"
+            : code === 0
+              ? "clean"
+              : "error",
+        });
+      } finally {
+        await this.finalize();
+      }
       return code;
     })();
 
