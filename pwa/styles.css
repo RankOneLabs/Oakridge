@@ -259,7 +259,8 @@ body {
 .card summary:focus-visible,
 .row-thinking summary:focus-visible,
 .tool-batch-summary:focus-visible,
-.tool-entry summary:focus-visible {
+.tool-entry summary:focus-visible,
+.bubble-user-slash > summary:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }
@@ -351,7 +352,7 @@ body {
   margin: 0;
   padding: 0.5rem 0.85rem 0.6rem;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
   font-size: 0.75rem;
   max-height: 40vh;
   overflow-y: auto;
@@ -1015,7 +1016,7 @@ body {
   font: inherit;
   font-size: 0.8rem;
   cursor: pointer;
-  min-height: 36px;
+  min-height: 44px;
   white-space: nowrap;
 }
 .btn-stop:hover:not(:disabled) {

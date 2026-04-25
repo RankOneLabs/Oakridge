@@ -898,10 +898,16 @@ function PendingUserBubble({
 function ThinkingIndicator() {
   return (
     <div className="row row-system">
-      <div className="thinking-indicator" aria-label="Claude is working">
-        <span className="thinking-dot" />
-        <span className="thinking-dot" />
-        <span className="thinking-dot" />
+      <div
+        className="thinking-indicator"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-label="Claude is working"
+      >
+        <span className="thinking-dot" aria-hidden="true" />
+        <span className="thinking-dot" aria-hidden="true" />
+        <span className="thinking-dot" aria-hidden="true" />
         <span className="thinking-label">thinking</span>
       </div>
     </div>
