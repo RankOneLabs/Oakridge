@@ -1451,11 +1451,44 @@ type ContentBlock =
       is_error?: boolean;
     };
 
+// CC expands a `/foo bar` invocation into a giant blob that begins with
+// `<command-message>`, `<command-name>`, `<command-args>` and then the full
+// skill body. Rendered raw it dominates the transcript; collapse it to a
+// single chip showing the invocation, with the full body one tap away.
+function parseSlashCommand(
+  text: string,
+): { name: string; args: string } | null {
+  if (!text.startsWith("<command-")) return null;
+  const nameMatch = text.match(/<command-name>\s*\/?([^<]*)<\/command-name>/);
+  if (!nameMatch) return null;
+  const argsMatch = text.match(/<command-args>([^<]*)<\/command-args>/);
+  return {
+    name: nameMatch[1].trim(),
+    args: argsMatch ? argsMatch[1].trim() : "",
+  };
+}
+
 function UserRow({ event }: { event: EnvelopeEvent }) {
   const p = event.payload as CCUserPayload;
   const content = p.message?.content;
 
   if (typeof content === "string") {
+    const slash = parseSlashCommand(content);
+    if (slash) {
+      return (
+        <div className="row row-user">
+          <details className="bubble bubble-user bubble-user-slash">
+            <summary>
+              <span className="bubble-slash-name">/{slash.name}</span>
+              {slash.args && (
+                <span className="bubble-slash-args">{slash.args}</span>
+              )}
+            </summary>
+            <pre className="bubble-slash-body">{content}</pre>
+          </details>
+        </div>
+      );
+    }
     return (
       <div className="row row-user">
         <div className="bubble bubble-user">{content}</div>

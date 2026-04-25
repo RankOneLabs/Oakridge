@@ -313,6 +313,55 @@ body {
   color: var(--bubble-user-fg);
   border-bottom-right-radius: 4px;
 }
+.bubble-user-slash {
+  padding: 0;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  max-width: 90%;
+}
+.bubble-user-slash > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem 0.85rem;
+  min-height: 36px;
+}
+.bubble-user-slash > summary::-webkit-details-marker {
+  display: none;
+}
+.bubble-user-slash > summary::before {
+  content: "▸";
+  color: var(--bubble-user-fg);
+  opacity: 0.7;
+  flex-shrink: 0;
+  transition: transform 0.12s ease-out;
+}
+.bubble-user-slash[open] > summary::before {
+  transform: rotate(90deg);
+}
+.bubble-slash-name {
+  font-weight: 600;
+}
+.bubble-slash-args {
+  opacity: 0.85;
+}
+.bubble-slash-body {
+  margin: 0;
+  padding: 0.5rem 0.85rem 0.6rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.75rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
+}
+@media (prefers-reduced-motion: reduce) {
+  .bubble-user-slash > summary::before {
+    transition: none;
+  }
+}
 .bubble-assistant {
   background: var(--bubble-assistant-bg);
   color: var(--bubble-assistant-fg);
