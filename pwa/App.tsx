@@ -713,12 +713,17 @@ function SessionView({
     seenIds.current = new Set();
   }, [sid]);
 
-  const addPendingMessage = useCallback((text: string) => {
+  const addPendingMessage = useCallback((text: string): number => {
     const localId = ++pendingIdSeq.current;
     setPendingMessages((prev) => [
       ...prev,
       { localId, text, sentAt: Date.now() },
     ]);
+    return localId;
+  }, []);
+
+  const removePendingMessage = useCallback((localId: number) => {
+    setPendingMessages((prev) => prev.filter((m) => m.localId !== localId));
   }, []);
 
   useEffect(() => {
@@ -843,7 +848,12 @@ function SessionView({
       ))}
       {awaitingResult && <ThinkingIndicator />}
       {canInput && (
-        <InputBox sid={sid} onSend={addPendingMessage} canStop={true} />
+        <InputBox
+          sid={sid}
+          onSend={addPendingMessage}
+          onSendFailed={removePendingMessage}
+          canStop={true}
+        />
       )}
       {!canInput && snapshot?.status === "ended" && (
         <EndedBanner
@@ -1808,10 +1818,12 @@ function UnknownRow({
 function InputBox({
   sid,
   onSend,
+  onSendFailed,
   canStop,
 }: {
   sid: string;
-  onSend: (text: string) => void;
+  onSend: (text: string) => number;
+  onSendFailed: (localId: number) => void;
   canStop: boolean;
 }) {
   const [text, setText] = useState("");
@@ -1825,13 +1837,19 @@ function InputBox({
     if (!payload || sending) return;
     // Clear the input + add the optimistic bubble *before* the network round
     // trip so the operator gets immediate "I sent" feedback even on a slow
-    // tailnet. If the POST fails we surface the error inline; the optimistic
-    // bubble stays so the operator can copy/retry the text rather than
-    // losing it.
+    // tailnet. On failure we roll the bubble back so awaitingResult doesn't
+    // sit on a phantom in-flight message; the operator's text is restored
+    // to the input box alongside the inline error so they can edit/retry
+    // without losing it.
     setText("");
     setSending(true);
     setError(null);
-    onSend(payload);
+    const localId = onSend(payload);
+    const fail = (msg: string) => {
+      onSendFailed(localId);
+      setText(payload);
+      setError(msg);
+    };
     try {
       const res = await fetch(`/${encodeURIComponent(sid)}/input`, {
         method: "POST",
@@ -1842,14 +1860,14 @@ function InputBox({
         const body = (await res.json().catch(() => null)) as {
           error?: unknown;
         } | null;
-        setError(
+        fail(
           typeof body?.error === "string"
             ? body.error
             : `server returned ${res.status}`,
         );
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "network error");
+      fail(err instanceof Error ? err.message : "network error");
     } finally {
       setSending(false);
     }
