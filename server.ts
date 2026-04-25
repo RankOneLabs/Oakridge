@@ -712,21 +712,26 @@ app.post("/sessions", async (c) => {
   try {
     const bodyText = await c.req.text();
     if (bodyText !== "") {
-      const raw = JSON.parse(bodyText) as {
-        resume_from?: unknown;
-        workdir?: unknown;
-      };
-      if (raw && raw.resume_from !== undefined) {
-        if (typeof raw.resume_from !== "string") {
+      const raw = JSON.parse(bodyText) as unknown;
+      // Reject arrays / strings / numbers explicitly: property access on
+      // them silently yields undefined, so without this check a body like
+      // `[]` or `"foo"` would slip through as "no options" and spawn a
+      // fresh session under --workdir, masking client bugs.
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+        return c.json({ error: "json body must be an object" }, 400);
+      }
+      const parsed = raw as { resume_from?: unknown; workdir?: unknown };
+      if (parsed.resume_from !== undefined) {
+        if (typeof parsed.resume_from !== "string") {
           return c.json({ error: "resume_from must be a string" }, 400);
         }
-        resumeFrom = raw.resume_from;
+        resumeFrom = parsed.resume_from;
       }
-      if (raw && raw.workdir !== undefined) {
-        if (typeof raw.workdir !== "string") {
+      if (parsed.workdir !== undefined) {
+        if (typeof parsed.workdir !== "string") {
           return c.json({ error: "workdir must be a string" }, 400);
         }
-        bodyWorkdir = raw.workdir;
+        bodyWorkdir = parsed.workdir;
       }
     }
   } catch {
@@ -735,7 +740,11 @@ app.post("/sessions", async (c) => {
 
   let spawnOpts: CreateSessionOpts;
   if (resumeFrom === null) {
-    const target = bodyWorkdir ?? workdir;
+    // Normalize via resolve() so /repo, /repo/, and /repo/..//repo all
+    // collapse to one canonical workdir before validation + persistence —
+    // matches the startup --workdir handling so the same path doesn't
+    // show up as two distinct workdirs across the UI.
+    const target = resolve(bodyWorkdir ?? workdir);
     const err = await validateWorkdir(target);
     if (err) return c.json({ error: err }, 400);
     spawnOpts = { workdir: target };
@@ -759,12 +768,25 @@ app.post("/sessions", async (c) => {
         400,
       );
     }
+    // Validate the inherited workdir before spawn — archived metadata
+    // can outlive the directory it points at (e.g. operator deleted the
+    // worktree). Without this check, Bun.spawn fails downstream and the
+    // caller sees an opaque 500. Re-resolve so a parent stored as
+    // /repo/.//worktree still validates against /repo/worktree.
+    const parentWorkdir = resolve(parentInfo.workdir);
+    const parentErr = await validateWorkdir(parentWorkdir);
+    if (parentErr) {
+      return c.json(
+        { error: `resume_from parent workdir invalid: ${parentErr}` },
+        400,
+      );
+    }
     spawnOpts = {
       // Spawn under the parent's workdir, not the server default. If the
       // operator restarted the server with a different --workdir, the
       // resumed subprocess still needs parent's cwd to match what the
       // transcript assumes.
-      workdir: parentInfo.workdir,
+      workdir: parentWorkdir,
       parentCcSid: parentInfo.parentCcSid,
       parentOakridgeSid: resumeFrom,
     };
