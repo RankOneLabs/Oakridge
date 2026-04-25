@@ -342,30 +342,45 @@ function SessionListView({
   const [pending, setPending] = useState(false);
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [workdirInput, setWorkdirInput] = useState("");
+  const [workdirTouched, setWorkdirTouched] = useState(false);
   const sorted = useMemo(() => sortSessions(sessions), [sessions]);
+
+  // Prefill the workdir input with the server default once /config resolves,
+  // but only if the operator hasn't typed anything yet — otherwise a slow
+  // /config response would clobber what they were mid-typing. workdirTouched
+  // also prevents re-prefilling after the operator deliberately cleared it.
+  useEffect(() => {
+    if (workdirTouched) return;
+    if (defaultWorkdir && workdirInput === "") {
+      setWorkdirInput(defaultWorkdir);
+    }
+  }, [defaultWorkdir, workdirInput, workdirTouched]);
 
   // Shared POST /sessions path for both the "+ New session" button and
   // row-level Resume buttons. Resume passes resume_from and ignores
-  // workdir (parent's workdir wins server-side); a fresh session sends
-  // the workdir from the input box (falling back to the server default
-  // if blank).
+  // workdir (parent's workdir wins server-side); a fresh session requires
+  // an explicit workdir from the input box (prefilled with the server
+  // default, but the operator has to consciously submit a value).
   async function startSession(resumeFrom?: string) {
     if (pending) return;
-    setPending(true);
     setPendingError(null);
-    try {
-      const body: { resume_from?: string; workdir?: string } = {};
-      if (resumeFrom) {
-        body.resume_from = resumeFrom;
-      } else {
-        const trimmed = workdirInput.trim();
-        if (trimmed) body.workdir = trimmed;
+    const body: { resume_from?: string; workdir?: string } = {};
+    if (resumeFrom) {
+      body.resume_from = resumeFrom;
+    } else {
+      const trimmed = workdirInput.trim();
+      if (!trimmed) {
+        setPendingError("workdir is required");
+        return;
       }
-      const hasBody = Object.keys(body).length > 0;
+      body.workdir = trimmed;
+    }
+    setPending(true);
+    try {
       const res = await fetch("/sessions", {
         method: "POST",
-        headers: hasBody ? { "content-type": "application/json" } : undefined,
-        body: hasBody ? JSON.stringify(body) : undefined,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const responseBody = (await res.json().catch(() => null)) as {
@@ -422,19 +437,23 @@ function SessionListView({
           <input
             type="text"
             className="new-session-workdir"
-            placeholder={defaultWorkdir || "/absolute/path/to/workdir"}
+            placeholder="/absolute/path/to/workdir"
             value={workdirInput}
-            onChange={(e) => setWorkdirInput(e.target.value)}
+            onChange={(e) => {
+              setWorkdirInput(e.target.value);
+              setWorkdirTouched(true);
+            }}
             disabled={pending}
+            required
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
-            aria-label="Workdir for new session (blank = server default)"
+            aria-label="Workdir for new session"
           />
           <button
             type="submit"
             className="btn-new-session"
-            disabled={pending}
+            disabled={pending || workdirInput.trim() === ""}
           >
             {pending ? "starting…" : "+ New"}
           </button>

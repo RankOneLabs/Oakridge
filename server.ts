@@ -38,7 +38,15 @@ if (!values.workdir) {
   process.exit(1);
 }
 
-const workdir = values.workdir;
+// Resolve to an absolute path before validation so /config and the initial
+// session both see the same canonical workdir regardless of how the operator
+// invoked cc-start (e.g. `--workdir=.` or a relative path from a script).
+const workdir = resolve(values.workdir);
+const startupWorkdirErr = await validateWorkdir(workdir);
+if (startupWorkdirErr) {
+  console.error(`cc-deck: invalid --workdir=${values.workdir}: ${startupWorkdirErr}`);
+  process.exit(1);
+}
 const port = Number(values.port);
 if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   console.error(`invalid --port=${values.port}`);
