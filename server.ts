@@ -2,9 +2,9 @@ import { Hono, type Context } from "hono";
 import { serveStatic } from "hono/bun";
 import { streamSSE } from "hono/streaming";
 import { parseArgs } from "node:util";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionManager, type CreateSessionOpts } from "./session-manager";
@@ -598,6 +598,17 @@ app.post("/:sid/approval", async (c) => {
   return approvalForSession(session, c);
 });
 
+// ---- server config ----
+//
+// Exposes the operator-configured defaults the PWA needs to render forms
+// (currently just the default workdir). Kept tiny on purpose: this is not a
+// place to grow generic settings — anything per-session belongs in the
+// session snapshot.
+
+app.get("/config", (c) => {
+  return c.json({ defaultWorkdir: workdir });
+});
+
 // ---- sessions CRUD ----
 
 app.get("/sessions", async (c) => {
@@ -678,11 +689,13 @@ app.get("/inbox", (c) => {
 });
 
 app.post("/sessions", async (c) => {
-  // Optional body: { resume_from?: string }. No body / missing field =
-  // a fresh session from scratch (unchanged from PR 2). resume_from is an
-  // oakridgeSid whose parent CC session should be inherited as context
-  // via --resume <parentCcSid> --fork-session.
+  // Optional body: { resume_from?: string, workdir?: string }. No body /
+  // missing fields = a fresh session under the server's --workdir.
+  // resume_from is an oakridgeSid whose parent CC session should be
+  // inherited as context via --resume <parentCcSid> --fork-session, and
+  // ignores any workdir override (the parent's workdir is authoritative).
   let resumeFrom: string | null = null;
+  let bodyWorkdir: string | null = null;
   // Read raw text first so we can distinguish "no body" (treat as no
   // options, preserves the old POST /sessions behavior) from "bad body"
   // (400). Using c.req.json() with an inner .catch() would silently
@@ -691,12 +704,21 @@ app.post("/sessions", async (c) => {
   try {
     const bodyText = await c.req.text();
     if (bodyText !== "") {
-      const raw = JSON.parse(bodyText) as { resume_from?: unknown };
+      const raw = JSON.parse(bodyText) as {
+        resume_from?: unknown;
+        workdir?: unknown;
+      };
       if (raw && raw.resume_from !== undefined) {
         if (typeof raw.resume_from !== "string") {
           return c.json({ error: "resume_from must be a string" }, 400);
         }
         resumeFrom = raw.resume_from;
+      }
+      if (raw && raw.workdir !== undefined) {
+        if (typeof raw.workdir !== "string") {
+          return c.json({ error: "workdir must be a string" }, 400);
+        }
+        bodyWorkdir = raw.workdir;
       }
     }
   } catch {
@@ -705,7 +727,10 @@ app.post("/sessions", async (c) => {
 
   let spawnOpts: CreateSessionOpts;
   if (resumeFrom === null) {
-    spawnOpts = { workdir };
+    const target = bodyWorkdir ?? workdir;
+    const err = await validateWorkdir(target);
+    if (err) return c.json({ error: err }, 400);
+    spawnOpts = { workdir: target };
   } else {
     if (!isValidSid(resumeFrom)) {
       return c.json({ error: "invalid resume_from" }, 400);
@@ -745,6 +770,26 @@ app.post("/sessions", async (c) => {
     return c.json({ error: `spawn failed: ${msg}` }, 500);
   }
 });
+
+/**
+ * Validates a workdir string for POST /sessions. Returns null if OK or a
+ * human-readable error string for the 400 response. We require absolute
+ * paths so the spawn cwd is unambiguous regardless of how the operator
+ * launched the server, and verify existence + directory-ness so the
+ * failure surfaces as a clear 400 instead of a downstream Bun.spawn
+ * error. Operator input is trusted (this is a localhost/tailnet tool),
+ * so no sandbox/allowlist beyond that.
+ */
+async function validateWorkdir(path: string): Promise<string | null> {
+  if (!isAbsolute(path)) return "workdir must be an absolute path";
+  try {
+    const s = await stat(path);
+    if (!s.isDirectory()) return "workdir is not a directory";
+  } catch {
+    return "workdir does not exist";
+  }
+  return null;
+}
 
 /**
  * Look up a resume parent's ccSid + workdir. Checks the live map first

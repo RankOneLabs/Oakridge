@@ -495,6 +495,31 @@ body {
   padding: 0.75rem 0;
 }
 
+.new-session-form {
+  display: flex;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+.new-session-workdir {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  color: var(--text-primary);
+  padding: 0 0.7rem;
+  min-height: 44px;
+  font: inherit;
+  font-size: 0.9rem;
+}
+.new-session-workdir:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+.new-session-workdir::placeholder {
+  color: var(--text-fainter);
+}
+
 .btn-new-session {
   background: var(--accent-blue);
   color: #ffffff;
@@ -506,6 +531,7 @@ body {
   font-weight: 600;
   font-size: 0.95rem;
   cursor: pointer;
+  white-space: nowrap;
 }
 .btn-new-session:disabled {
   opacity: 0.5;
