@@ -94,6 +94,33 @@ function useHashSid(): [string | null, (sid: string | null) => void] {
   return [sid, navigate];
 }
 
+/**
+ * Fetches the server's /config once on mount. Currently exposes the
+ * default workdir so the new-session form can prefill it. Returns null
+ * until the fetch resolves, so callers can render a "loading" placeholder
+ * rather than racing the form into life with an empty default.
+ */
+function useServerConfig(): { defaultWorkdir: string } | null {
+  const [config, setConfig] = useState<{ defaultWorkdir: string } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/config")
+      .then((r) => r.json() as Promise<{ defaultWorkdir: string }>)
+      .then((data) => {
+        if (!cancelled) setConfig(data);
+      })
+      .catch(() => {
+        // Server may be down or this build is older — leave config null,
+        // the form will show a generic placeholder and the server will
+        // still validate whatever the operator types.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return config;
+}
+
 function useTheme(): [Theme, () => void] {
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
   useEffect(() => {
@@ -265,6 +292,7 @@ export function App() {
   const [sid, navigate] = useHashSid();
   const [theme, toggleTheme] = useTheme();
   const { sessions, inMemorySids, inboxStatus, hydrateSession } = useInbox();
+  const config = useServerConfig();
 
   if (sid === null) {
     return (
@@ -272,6 +300,7 @@ export function App() {
         sessions={sessions}
         inboxStatus={inboxStatus}
         theme={theme}
+        defaultWorkdir={config?.defaultWorkdir ?? ""}
         onToggleTheme={toggleTheme}
         onSelect={(nextSid) => navigate(nextSid)}
         onHydrateSession={hydrateSession}
@@ -297,6 +326,7 @@ function SessionListView({
   sessions,
   inboxStatus,
   theme,
+  defaultWorkdir,
   onToggleTheme,
   onSelect,
   onHydrateSession,
@@ -304,34 +334,61 @@ function SessionListView({
   sessions: Map<string, SessionSnapshot>;
   inboxStatus: Status;
   theme: Theme;
+  defaultWorkdir: string;
   onToggleTheme: () => void;
   onSelect: (sid: string) => void;
   onHydrateSession: (snapshot: SessionSnapshot) => void;
 }) {
   const [pending, setPending] = useState(false);
   const [pendingError, setPendingError] = useState<string | null>(null);
+  const [workdirInput, setWorkdirInput] = useState("");
+  const [workdirTouched, setWorkdirTouched] = useState(false);
   const sorted = useMemo(() => sortSessions(sessions), [sessions]);
 
+  // Prefill the workdir input with the server default once /config resolves,
+  // but only if the operator hasn't typed anything yet — otherwise a slow
+  // /config response would clobber what they were mid-typing. workdirTouched
+  // also prevents re-prefilling after the operator deliberately cleared it.
+  useEffect(() => {
+    if (workdirTouched) return;
+    if (defaultWorkdir && workdirInput === "") {
+      setWorkdirInput(defaultWorkdir);
+    }
+  }, [defaultWorkdir, workdirInput, workdirTouched]);
+
   // Shared POST /sessions path for both the "+ New session" button and
-  // row-level Resume buttons. A resume request passes resume_from;
-  // undefined body kicks off a fresh session.
+  // row-level Resume buttons. Resume passes resume_from and ignores
+  // workdir (parent's workdir wins server-side); a fresh session requires
+  // an explicit workdir from the input box (prefilled with the server
+  // default, but the operator has to consciously submit a value).
   async function startSession(resumeFrom?: string) {
     if (pending) return;
-    setPending(true);
     setPendingError(null);
+    const body: { resume_from?: string; workdir?: string } = {};
+    if (resumeFrom) {
+      body.resume_from = resumeFrom;
+    } else {
+      const trimmed = workdirInput.trim();
+      if (!trimmed) {
+        setPendingError("workdir is required");
+        return;
+      }
+      body.workdir = trimmed;
+    }
+    setPending(true);
     try {
       const res = await fetch("/sessions", {
         method: "POST",
-        headers: resumeFrom ? { "content-type": "application/json" } : undefined,
-        body: resumeFrom ? JSON.stringify({ resume_from: resumeFrom }) : undefined,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as {
+        const responseBody = (await res.json().catch(() => null)) as {
           error?: unknown;
         } | null;
         setPendingError(
-          typeof body?.error === "string"
-            ? body.error
+          typeof responseBody?.error === "string"
+            ? responseBody.error
             : `server returned ${res.status}`,
         );
         return;
@@ -370,14 +427,37 @@ function SessionListView({
         </button>
       </header>
       <div className="session-list-actions">
-        <button
-          type="button"
-          className="btn-new-session"
-          onClick={() => void startSession()}
-          disabled={pending}
+        <form
+          className="new-session-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void startSession();
+          }}
         >
-          {pending ? "starting…" : "+ New session"}
-        </button>
+          <input
+            type="text"
+            className="new-session-workdir"
+            placeholder="/absolute/path/to/workdir"
+            value={workdirInput}
+            onChange={(e) => {
+              setWorkdirInput(e.target.value);
+              setWorkdirTouched(true);
+            }}
+            disabled={pending}
+            required
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            aria-label="Workdir for new session"
+          />
+          <button
+            type="submit"
+            className="btn-new-session"
+            disabled={pending || workdirInput.trim() === ""}
+          >
+            {pending ? "starting…" : "+ New"}
+          </button>
+        </form>
         {pendingError && (
           <div className="input-error" role="alert">
             error: {pendingError}

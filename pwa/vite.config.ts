@@ -14,6 +14,7 @@ export default defineConfig({
       // Top-level API routes used by the session list + inbox + CRUD.
       "/sessions": { target: backendTarget, changeOrigin: true },
       "/inbox": { target: backendTarget, changeOrigin: true },
+      "/config": { target: backendTarget, changeOrigin: true },
       // Per-sid routes. Keyed by regex so any sid prefix gets proxied.
       // Must start with ^ for vite to treat the key as a RegExp.
       "^/[^/]+/(stream|events|input|approval|yolo)(\\?.*)?$": {
