@@ -257,7 +257,10 @@ body {
 .yolo-toggle:focus-visible,
 .theme-toggle:focus-visible,
 .card summary:focus-visible,
-.row-thinking summary:focus-visible {
+.row-thinking summary:focus-visible,
+.tool-batch-summary:focus-visible,
+.tool-entry summary:focus-visible,
+.bubble-user-slash > summary:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }
@@ -310,6 +313,55 @@ body {
   background: var(--bubble-user-bg);
   color: var(--bubble-user-fg);
   border-bottom-right-radius: 4px;
+}
+.bubble-user-slash {
+  padding: 0;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  max-width: 90%;
+}
+.bubble-user-slash > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem 0.85rem;
+  min-height: 36px;
+}
+.bubble-user-slash > summary::-webkit-details-marker {
+  display: none;
+}
+.bubble-user-slash > summary::before {
+  content: "▸";
+  color: var(--bubble-user-fg);
+  opacity: 0.7;
+  flex-shrink: 0;
+  transition: transform 0.12s ease-out;
+}
+.bubble-user-slash[open] > summary::before {
+  transform: rotate(90deg);
+}
+.bubble-slash-name {
+  font-weight: 600;
+}
+.bubble-slash-args {
+  opacity: 0.85;
+}
+.bubble-slash-body {
+  margin: 0;
+  padding: 0.5rem 0.85rem 0.6rem;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  font-size: 0.75rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
+}
+@media (prefers-reduced-motion: reduce) {
+  .bubble-user-slash > summary::before {
+    transition: none;
+  }
 }
 .bubble-assistant {
   background: var(--bubble-assistant-bg);
@@ -370,18 +422,35 @@ body {
   list-style: none;
   display: flex;
   gap: 0.5rem;
-  align-items: baseline;
+  align-items: center;
   color: var(--text-secondary);
+  min-height: 32px;
+  padding: 0.15rem 0;
+  border-radius: 4px;
+}
+.card summary:hover {
+  color: var(--text-primary);
 }
 .card summary::-webkit-details-marker {
   display: none;
 }
 .card summary::before {
   content: "▸";
-  color: var(--text-fainter);
+  color: var(--accent-blue);
+  font-size: 0.85rem;
+  display: inline-block;
+  width: 0.9em;
+  flex-shrink: 0;
+  transition: transform 0.12s ease-out;
 }
 .card[open] summary::before {
-  content: "▾";
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .card summary::before,
+  .tool-batch-summary::before {
+    transition: none;
+  }
 }
 
 .card-label {
@@ -480,6 +549,157 @@ body {
 }
 .notice-deny {
   color: var(--danger-fg);
+}
+
+/* === tool batch (groups consecutive tool_use/tool_result events into a
+   single collapsible section so a long YOLO-mode turn doesn't dominate the
+   transcript). === */
+.tool-batch {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  width: 100%;
+}
+.tool-batch-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.5rem 0.7rem;
+  min-height: 36px;
+  color: var(--text-secondary);
+}
+.tool-batch-summary:hover {
+  color: var(--text-primary);
+}
+.tool-batch-summary::-webkit-details-marker {
+  display: none;
+}
+.tool-batch-summary::before {
+  content: "▸";
+  color: var(--accent-blue);
+  flex-shrink: 0;
+  transition: transform 0.12s ease-out;
+}
+.tool-batch[open] .tool-batch-summary::before {
+  transform: rotate(90deg);
+}
+.tool-batch-count {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.tool-batch-names {
+  color: var(--accent-name);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.tool-batch-errors {
+  color: var(--danger-fg);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.tool-batch-body {
+  padding: 0 0.4rem 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.tool-entry {
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+}
+.tool-entry summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.35rem 0.55rem;
+  min-height: 30px;
+  color: var(--text-secondary);
+}
+.tool-entry summary:hover {
+  color: var(--text-primary);
+}
+.tool-entry summary::-webkit-details-marker {
+  display: none;
+}
+.tool-entry summary::before {
+  content: "▸";
+  color: var(--text-fainter);
+  flex-shrink: 0;
+}
+.tool-entry[open] summary::before {
+  content: "▾";
+  color: var(--accent-blue);
+}
+.tool-entry-name {
+  color: var(--accent-name);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.tool-entry-preview {
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.tool-entry-status {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.tool-entry.is-error {
+  border-color: var(--danger-card-border);
+  background: var(--danger-card-bg);
+}
+.tool-entry.is-error .tool-entry-status {
+  color: var(--danger-fg);
+}
+.tool-entry.is-pending .tool-entry-status {
+  color: var(--amber-fg);
+}
+.tool-entry-body {
+  padding: 0 0.55rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.tool-entry-section-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  margin-top: 0.25rem;
+}
+.tool-entry-block {
+  margin: 0;
+  padding: 0.4rem 0.5rem;
+  background: var(--bg-code);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+  font-size: 0.75rem;
+  max-height: 30vh;
+  overflow-y: auto;
 }
 
 /* === session list === */
@@ -694,6 +914,26 @@ body {
   background: var(--bg-input-bar);
   border-top: 1px solid var(--border-subtle);
   z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.session-ended-text {
+  font-size: 0.85rem;
+}
+.session-ended-actions {
+  display: flex;
+  justify-content: center;
+}
+.btn-resume-banner {
+  position: static;
+  transform: none;
+  padding: 0.6rem 1.25rem;
+  font-size: 0.9rem;
+}
+.session-ended-error {
+  color: var(--danger-fg);
+  font-size: 0.8rem;
 }
 @media (min-width: 1024px) {
   .session-ended-banner {
@@ -758,6 +998,102 @@ body {
   background: var(--border-muted);
   color: var(--text-fainter);
   cursor: not-allowed;
+}
+
+.input-bar-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.btn-stop {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  padding: 0.4rem 0.75rem;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  min-height: 44px;
+  white-space: nowrap;
+}
+.btn-stop:hover:not(:disabled) {
+  color: var(--danger-fg);
+  border-color: var(--danger-fg);
+}
+.btn-stop.is-confirming {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  border-color: var(--danger-fg);
+  font-weight: 600;
+}
+.btn-stop:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Optimistic user bubble shown immediately on send. Visually echoes the
+   real bubble but slightly faded with an inline status tag. */
+.bubble-user-pending {
+  opacity: 0.65;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.bubble-pending-tag {
+  font-size: 0.7rem;
+  opacity: 0.85;
+  font-style: italic;
+  letter-spacing: 0.02em;
+}
+
+.thinking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  padding: 0.35rem 0.7rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-family: "SF Mono", Menlo, monospace;
+}
+.thinking-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: thinking-bounce 1.2s infinite ease-in-out;
+}
+.thinking-dot:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.thinking-dot:nth-child(3) {
+  animation-delay: 0.36s;
+}
+.thinking-label {
+  margin-left: 0.25rem;
+}
+@keyframes thinking-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thinking-dot {
+    animation: none;
+    opacity: 0.6;
+  }
 }
 
 /* === desktop: wider container, denser cards, inline input === */
