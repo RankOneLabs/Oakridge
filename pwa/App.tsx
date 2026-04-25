@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -673,12 +674,16 @@ function SessionView({
   const pendingIdSeq = useRef(0);
   const endRef = useRef<HTMLDivElement>(null);
 
-  // Awaiting a turn result if we have an optimistic message in flight, OR
-  // if the live transcript shows a user-input event (text content, not
-  // tool_result blocks) more recent than the most recent `result` event.
-  // The second clause means a viewer landing on a session another phone
-  // just sent into still sees the thinking indicator.
+  // Awaiting a turn result if the session is live AND (we have an optimistic
+  // message in flight OR the transcript shows a user-input event more recent
+  // than the most recent `result` event). The session-status gate prevents
+  // the indicator from getting stuck on a read-only ended transcript when
+  // the operator stops mid-turn or the subprocess crashes before emitting a
+  // result. The events-derived clause means a viewer landing on a session
+  // another phone just sent into still sees the thinking indicator.
+  const sessionStatus = snapshot?.status ?? null;
   const awaitingResult = useMemo(() => {
+    if (sessionStatus !== "live") return false;
     if (pendingMessages.length > 0) return true;
     let lastResultIdx = -1;
     for (let i = events.length - 1; i >= 0; i--) {
@@ -696,7 +701,7 @@ function SessionView({
       if (e.type === "assistant") return true;
     }
     return false;
-  }, [events, pendingMessages.length]);
+  }, [events, pendingMessages.length, sessionStatus]);
 
   useLayoutEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
@@ -712,6 +717,13 @@ function SessionView({
     setPendingMessages([]);
     seenIds.current = new Set();
   }, [sid]);
+
+  // Drop optimistic bubbles when the session is no longer live so a
+  // mid-turn Stop / subprocess crash doesn't leave a permanent
+  // "delivered · awaiting reply" tag on the read-only transcript.
+  useEffect(() => {
+    if (sessionStatus !== "live") setPendingMessages([]);
+  }, [sessionStatus]);
 
   const addPendingMessage = useCallback((text: string): number => {
     const localId = ++pendingIdSeq.current;
@@ -840,7 +852,7 @@ function SessionView({
         resolutions={resolutions}
         allowedTools={allowedTools}
         sid={sid}
-        sessionStatus={snapshot?.status ?? null}
+        sessionStatus={sessionStatus}
         showSystemEvents={showSystemEvents}
       />
       {pendingMessages.map((m) => (
@@ -1281,19 +1293,32 @@ function summarizeToolNames(names: string[]): string {
     .join(", ");
 }
 
-function ToolBatchEntry({
+// Memoized: a YOLO-mode batch can carry 50+ entries each holding a
+// non-trivial input/result payload. Without memo every transcript scroll /
+// SSE event re-runs the full JSON.stringify on every entry. Inputs are
+// stable once they arrive (results land once, then never change), so memo
+// against the use+result identity is safe.
+const ToolBatchEntry = memo(function ToolBatchEntry({
   use,
   result,
 }: {
   use: ToolUseEntry;
   result: ToolResultEntry | null;
 }) {
-  const inputPreview = previewToolInput(use.name, use.input);
-  const resultText = result
-    ? typeof result.content === "string"
+  const inputPreview = useMemo(
+    () => previewToolInput(use.name, use.input),
+    [use.name, use.input],
+  );
+  const inputJson = useMemo(
+    () => JSON.stringify(use.input, null, 2),
+    [use.input],
+  );
+  const resultText = useMemo(() => {
+    if (!result) return "";
+    return typeof result.content === "string"
       ? result.content
-      : (JSON.stringify(result.content ?? null) ?? "null")
-    : "";
+      : (JSON.stringify(result.content ?? null) ?? "null");
+  }, [result]);
   return (
     <details
       className={`tool-entry ${result?.isError ? "is-error" : ""} ${result ? "" : "is-pending"}`}
@@ -1306,9 +1331,7 @@ function ToolBatchEntry({
       </summary>
       <div className="tool-entry-body">
         <div className="tool-entry-section-label">input</div>
-        <pre className="tool-entry-block">
-          {JSON.stringify(use.input, null, 2)}
-        </pre>
+        <pre className="tool-entry-block">{inputJson}</pre>
         {result && (
           <>
             <div className="tool-entry-section-label">
@@ -1320,7 +1343,7 @@ function ToolBatchEntry({
       </div>
     </details>
   );
-}
+});
 
 // Most-common tools have a recognizable single field that makes a far better
 // inline preview than a JSON dump. Fall back to the raw JSON for anything
@@ -1400,9 +1423,11 @@ function EventRow({
   if (!showSystemEvents && isLowSignalEvent(event)) return null;
   switch (event.type) {
     case "user":
-      return <UserRow event={event} />;
+      return <UserRow event={event} showSystemEvents={showSystemEvents} />;
     case "assistant":
-      return <AssistantRow event={event} />;
+      return (
+        <AssistantRow event={event} showSystemEvents={showSystemEvents} />
+      );
     case "permission_request":
       return (
         <PermissionRow
@@ -1474,7 +1499,13 @@ function parseSlashCommand(
   };
 }
 
-function UserRow({ event }: { event: EnvelopeEvent }) {
+function UserRow({
+  event,
+  showSystemEvents,
+}: {
+  event: EnvelopeEvent;
+  showSystemEvents: boolean;
+}) {
   const p = event.payload as CCUserPayload;
   const content = p.message?.content;
 
@@ -1516,20 +1547,26 @@ function UserRow({ event }: { event: EnvelopeEvent }) {
             );
           }
           return (
-              <UnknownRow
-                key={`${event.id}-${idx}`}
-                event={event}
-                compact={true}
-              />
-            );
+            <UnknownRow
+              key={`${event.id}-${idx}`}
+              event={event}
+              compact={!showSystemEvents}
+            />
+          );
         })}
       </>
     );
   }
-  return <UnknownRow event={event} compact={true} />;
+  return <UnknownRow event={event} compact={!showSystemEvents} />;
 }
 
-function AssistantRow({ event }: { event: EnvelopeEvent }) {
+function AssistantRow({
+  event,
+  showSystemEvents,
+}: {
+  event: EnvelopeEvent;
+  showSystemEvents: boolean;
+}) {
   const p = event.payload as CCAssistantPayload;
   const blocks = p.message?.content ?? [];
   return (
@@ -1558,7 +1595,13 @@ function AssistantRow({ event }: { event: EnvelopeEvent }) {
         if (block.type === "tool_use") {
           return <ToolUseCard key={key} block={block} />;
         }
-        return <UnknownRow key={key} event={event} compact={true} />;
+        return (
+          <UnknownRow
+            key={key}
+            event={event}
+            compact={!showSystemEvents}
+          />
+        );
       })}
     </>
   );
@@ -1876,19 +1919,18 @@ function InputBox({
     if (!payload || sending) return;
     // Clear the input + add the optimistic bubble *before* the network round
     // trip so the operator gets immediate "I sent" feedback even on a slow
-    // tailnet. On failure we roll the bubble back so awaitingResult doesn't
-    // sit on a phantom in-flight message; the operator's text is restored
-    // to the input box alongside the inline error so they can edit/retry
-    // without losing it.
+    // tailnet. Two failure modes, treated differently:
+    //  - Explicit non-OK response (4xx/5xx): server definitively rejected.
+    //    Roll the bubble back, restore the text, surface the server's
+    //    error so the operator can edit/retry without losing the message.
+    //  - Thrown fetch (network drop, server crash mid-request): we don't
+    //    know whether the server processed it. Leave the bubble in place
+    //    and warn that delivery is uncertain — re-sending could double the
+    //    command if the original actually went through.
     setText("");
     setSending(true);
     setError(null);
     const localId = onSend(payload);
-    const fail = (msg: string) => {
-      onSendFailed(localId);
-      setText(payload);
-      setError(msg);
-    };
     try {
       const res = await fetch(`/${encodeURIComponent(sid)}/input`, {
         method: "POST",
@@ -1899,14 +1941,19 @@ function InputBox({
         const body = (await res.json().catch(() => null)) as {
           error?: unknown;
         } | null;
-        fail(
+        const msg =
           typeof body?.error === "string"
             ? body.error
-            : `server returned ${res.status}`,
-        );
+            : `server returned ${res.status}`;
+        onSendFailed(localId);
+        setText(payload);
+        setError(msg);
       }
     } catch (err) {
-      fail(err instanceof Error ? err.message : "network error");
+      const msg = err instanceof Error ? err.message : "network error";
+      setError(
+        `${msg} — delivery status unknown, check the transcript before retrying`,
+      );
     } finally {
       setSending(false);
     }
