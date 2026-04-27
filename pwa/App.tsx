@@ -180,7 +180,7 @@ interface InboxState {
   hydrateSession: (snapshot: SessionSnapshot) => void;
 }
 
-function useInbox(): InboxState {
+function useInbox(opts: { onSessionRemoved?: (sid: string) => void } = {}): InboxState {
   const [sessions, setSessions] = useState<Map<string, SessionSnapshot>>(
     () => new Map(),
   );
@@ -188,6 +188,15 @@ function useInbox(): InboxState {
     () => new Set(),
   );
   const [inboxStatus, setInboxStatus] = useState<Status>("connecting");
+  // Mirror onSessionRemoved into a ref so the EventSource handler (set up
+  // once on mount) reads the latest closure on each delta — otherwise it
+  // would call a stale callback that captured the initial render's sid.
+  // Assign during render rather than in a passive useEffect so there's no
+  // window between a re-render and the effect firing where a delta could
+  // hit the previous callback. Mutating a ref during render is sanctioned
+  // by the React docs for exactly this "always-fresh callback" pattern.
+  const onSessionRemovedRef = useRef(opts.onSessionRemoved);
+  onSessionRemovedRef.current = opts.onSessionRemoved;
 
   const hydrateSession = useCallback((snapshot: SessionSnapshot) => {
     setSessions((prev) => {
@@ -270,6 +279,9 @@ function useInbox(): InboxState {
           next.delete(delta.sid);
           return next;
         });
+        // Fire the consumer callback AFTER state setters so a navigate(null)
+        // it triggers lands on the same React batch as the map drop.
+        onSessionRemovedRef.current?.(delta.sid);
       }
       // session_ended keeps the sid in inMemorySids: ended sessions linger
       // in the manager map (and stream/events still work against them)
@@ -353,7 +365,16 @@ async function resumeSession(
 export function App() {
   const [sid, navigate] = useHashSid();
   const [theme, toggleTheme] = useTheme();
-  const { sessions, inMemorySids, inboxStatus, hydrateSession } = useInbox();
+  const { sessions, inMemorySids, inboxStatus, hydrateSession } = useInbox({
+    // When the active session is purged from another client / tab, drop
+    // back to the inbox list so SessionView isn't left rendering a stale
+    // transcript with no underlying session record. Comparing inside the
+    // callback (not via deps) is fine because the ref dance in useInbox
+    // ensures we always see the latest sid closure.
+    onSessionRemoved: (removedSid) => {
+      if (removedSid === sid) navigate(null);
+    },
+  });
   const config = useServerConfig();
 
   if (sid === null) {

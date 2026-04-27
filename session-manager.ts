@@ -86,6 +86,15 @@ export class SessionManager {
    * null = not yet loaded; non-null = loaded once, value is authoritative.
    */
   private archivedSnapshotCache: Map<string, SessionSnapshot> | null = null;
+  /**
+   * Single-flight guard for the initial archived scan. While a scan is in
+   * flight this holds the populating promise; concurrent
+   * listArchivedSnapshots() callers await the same promise instead of each
+   * launching a duplicate readdir+parse pass, and remove() awaits it before
+   * mutating the cache so a delete arriving mid-scan can't race with the
+   * later cache write and resurrect a purged sid.
+   */
+  private archivedScanPromise: Promise<void> | null = null;
 
   constructor(opts: SessionManagerOpts) {
     this.opts = opts;
@@ -93,9 +102,10 @@ export class SessionManager {
 
   async create(opts: CreateSessionOpts): Promise<Session> {
     const oakridgeSid = newSessionId();
-    // Server-side fallback so curl-without-name still produces a usable
-    // human-readable name. Real client always sends one (its placeholder
-    // value); this only fires for direct API hits.
+    // Server-side fallback so requests without a usable name still produce a
+    // human-readable session name. `name` is optional in practice, and
+    // resume/default client flows may omit it, so this can run for normal
+    // client traffic as well as direct API hits.
     const name =
       opts.name && opts.name.trim() ? opts.name.trim() : `session-${oakridgeSid.slice(0, 8)}`;
     const session = new Session({
@@ -200,17 +210,45 @@ export class SessionManager {
    * multiple tabs all fetch the list at once.
    */
   async listArchivedSnapshots(): Promise<SessionSnapshot[]> {
-    if (this.archivedSnapshotCache !== null) {
-      // Cache may contain entries for sessions that have since started in
-      // memory (extremely rare — would require a sid collision or a
-      // server-on-server scenario), so filter on read just like the cold
-      // path does.
-      const out: SessionSnapshot[] = [];
-      for (const [sid, snap] of this.archivedSnapshotCache) {
-        if (!this.sessions.has(sid)) out.push(snap);
+    // Cold path: if the cache hasn't been populated yet, kick off (or
+    // join) the single-flight scan. All concurrent callers await the same
+    // promise so the readdir+parse pass runs once. We catch rejection
+    // here so a transient scan failure surfaces as an empty list rather
+    // than a 500 from /sessions?include=archived; the .finally() in the
+    // launch site already clears archivedScanPromise so the next call
+    // retries the scan from scratch. Logged (not silently swallowed) so
+    // a real EACCES/I/O error on sessionsDir is diagnosable in server
+    // logs instead of looking like "no archived sessions".
+    if (this.archivedSnapshotCache === null) {
+      if (this.archivedScanPromise === null) {
+        this.archivedScanPromise = this.populateArchivedCache().finally(() => {
+          this.archivedScanPromise = null;
+        });
       }
-      return out;
+      await this.archivedScanPromise.catch((err) => {
+        console.error(
+          `cc-deck: archived snapshot scan failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
     }
+    // Re-read after the (possible) await — populateArchivedCache may have
+    // populated the cache, or thrown without populating. In the latter
+    // case we return an empty list and the next call will retry.
+    const cache: Map<string, SessionSnapshot> | null = this.archivedSnapshotCache;
+    if (cache === null) return [];
+    // Filter on read so an entry whose sid has since started in memory
+    // (extremely rare — would require a sid collision or a server-on-server
+    // scenario) doesn't escape the cache and confuse callers.
+    const out: SessionSnapshot[] = [];
+    cache.forEach((snap, sid) => {
+      if (!this.sessions.has(sid)) out.push(snap);
+    });
+    return out;
+  }
+
+  private async populateArchivedCache(): Promise<void> {
     const cache = new Map<string, SessionSnapshot>();
     let entries: string[];
     try {
@@ -225,7 +263,7 @@ export class SessionManager {
         // Empty cache is still a valid populated state — sessionsDir
         // missing is a normal cold start and shouldn't force a re-scan.
         this.archivedSnapshotCache = cache;
-        return [];
+        return;
       }
       throw err;
     }
@@ -238,9 +276,6 @@ export class SessionManager {
       if (snap) cache.set(sid, snap);
     }
     this.archivedSnapshotCache = cache;
-    const out: SessionSnapshot[] = [];
-    for (const snap of cache.values()) out.push(snap);
-    return out;
   }
 
   /**
@@ -274,18 +309,50 @@ export class SessionManager {
    * map, removes its JSONL from disk, and broadcasts session_removed.
    * Works on archived-only sids too (not in memory) — those just delete the
    * JSONL. Returns true if anything was removed (file or map entry), false
-   * if the sid was unknown to both.
+   * if the sid was unknown to both. Throws RemoveFailedError if unlink
+   * fails for any reason other than ENOENT, so the route handler can
+   * return 5xx instead of advertising a successful purge while removal
+   * of the transcript could not be confirmed (an EACCES on the parent
+   * directory, for example, fails before we'd know whether the file
+   * existed).
    *
-   * The abort happens BEFORE unlink so an active jsonlWriter doesn't race
-   * with the deletion: finalize() drains and ends the writer first, then
-   * we unlink.
+   * Order of operations:
+   *  1. Wait for any in-flight archived scan so we operate on a consistent
+   *     cache state (otherwise a scan finishing after our cache.delete()
+   *     could resurrect this sid).
+   *  2. Abort the live subprocess if any (drains the jsonlWriter so the
+   *     unlink doesn't race with an open FD).
+   *  3. Unlink the JSONL. ENOENT = already gone = success. Any other error
+   *     is propagated; the in-memory map entry stays put so a retry can
+   *     finish the job.
+   *  4. After unlink success (or ENOENT), evict from cache + drop map
+   *     entry + broadcast. These in-memory removals are part of the
+   *     "anything was removed" return contract; this step just does not
+   *     run if unlink fails for a non-ENOENT reason (we throw before
+   *     reaching it).
    */
   async remove(oakridgeSid: string): Promise<boolean> {
+    // Trigger the archived scan up front (if it hasn't run yet and isn't
+    // already in flight) but DON'T await it here — the scan needs to be
+    // resolved before we touch the cache, but we don't want it blocking
+    // the live-session abort below. Without this trigger, a
+    // listArchivedSnapshots() call landing mid-remove could start a fresh
+    // scan that reads the JSONL we're about to unlink and writes it back
+    // into the cache after our cache.delete() — resurrecting a purged
+    // sid. Kicking it off here ensures any later list call joins the same
+    // promise instead of starting a new one.
+    if (this.archivedSnapshotCache === null && this.archivedScanPromise === null) {
+      this.archivedScanPromise = this.populateArchivedCache().finally(() => {
+        this.archivedScanPromise = null;
+      });
+    }
     const session = this.sessions.get(oakridgeSid);
-    let touched = false;
     if (session) {
       // abort() is idempotent on already-ended sessions, so this is safe
-      // for both live and ended map entries.
+      // for both live and ended map entries. Run BEFORE the scan-await so
+      // a Remove tap on a live session kills the subprocess immediately
+      // instead of waiting ~130ms for the cold archived scan to finish.
+      // The scan still runs in parallel; we await it below.
       try {
         await session.abort();
       } catch (err) {
@@ -295,37 +362,61 @@ export class SessionManager {
           }`,
         );
       }
-      this.sessions.delete(oakridgeSid);
-      this.clearActivityTimer(oakridgeSid);
-      touched = true;
     }
-    const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
-    // Invalidate the archived cache for this sid up front so a concurrent
-    // listArchivedSnapshots() can't repopulate after the unlink.
-    if (this.archivedSnapshotCache?.delete(oakridgeSid)) touched = true;
-    try {
-      await unlink(jsonlPath);
-      touched = true;
-    } catch (err) {
-      // ENOENT is fine — the file may have been an in-memory-only
-      // session that never wrote anything, or already removed.
-      if (
-        !err ||
-        typeof err !== "object" ||
-        !("code" in err) ||
-        (err as { code: string }).code !== "ENOENT"
-      ) {
-        console.error(
-          `cc-deck: unlink failed for ${jsonlPath}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+    // Now resolve the scan promise (which has been running in parallel
+    // with the abort above). After this we know the cache is either
+    // populated or definitively failed to populate, so the cache.delete()
+    // below can't be undone by a late-completing scan.
+    if (this.archivedScanPromise) {
+      try {
+        await this.archivedScanPromise;
+      } catch {
+        // Scan failure is the scan's problem; we still want to attempt
+        // the remove. If the cache is null after this, the cache eviction
+        // step below is a no-op (and a later list call will retry the
+        // scan, which won't see this sid because we'll have unlinked it).
       }
     }
-    if (touched) {
+    const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
+    // Distinct from "unlink resolved without throwing": only true when
+    // unlink actually deleted a file (ENOENT does NOT set this). Seeded
+    // into `removed` below so any real file deletion counts as removal,
+    // even when the sid wasn't in the live map AND wasn't in the cache
+    // (e.g. an archived JSONL that loadArchivedSnapshot() skipped because
+    // it was empty/malformed). ENOENT keeps it false so a typo'd sid
+    // returns `removed: false` rather than a false-positive 200.
+    let unlinkDeletedFile = false;
+    try {
+      await unlink(jsonlPath);
+      unlinkDeletedFile = true;
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as { code: string }).code
+          : null;
+      if (code !== "ENOENT") {
+        // Real failure (EACCES, EBUSY, EIO, ...). Leave the in-memory map
+        // entry alone — the subprocess is already dead from the abort
+        // above, but the operator can still see a stuck row and retry.
+        // Do NOT broadcast session_removed; do NOT evict from cache.
+        throw new RemoveFailedError(oakridgeSid, jsonlPath, err);
+      }
+      // ENOENT — file was already gone. Resolved without throwing, but
+      // we did not actually delete anything; unlinkDeletedFile stays false.
+    }
+    // Past this point: unlink succeeded OR ENOENT (file already absent).
+    // Reflect the new state in our in-memory bookkeeping.
+    let removed = unlinkDeletedFile;
+    if (session) {
+      this.sessions.delete(oakridgeSid);
+      this.clearActivityTimer(oakridgeSid);
+      removed = true;
+    }
+    if (this.archivedSnapshotCache?.delete(oakridgeSid)) removed = true;
+    if (removed) {
       this.broadcastDelta({ type: "session_removed", sid: oakridgeSid });
     }
-    return touched;
+    return removed;
   }
 
   /**
@@ -408,6 +499,31 @@ export class SessionManager {
       this.flushActivity(sid);
     }
     this.lastActivityFlushAt.delete(sid);
+  }
+}
+
+/**
+ * Thrown by SessionManager.remove() when unlinking the JSONL fails for
+ * any reason other than ENOENT. The HTTP route handler catches this and
+ * returns a 500 so the client doesn't see a misleading "removed"
+ * success while the transcript may still be present. ENOENT is
+ * intentionally treated as success in remove() and never throws this.
+ */
+export class RemoveFailedError extends Error {
+  readonly sid: string;
+  readonly jsonlPath: string;
+  // `cause` is on the ES2022 Error base; `override` keeps strict TS happy.
+  override readonly cause: unknown;
+  constructor(sid: string, jsonlPath: string, cause: unknown) {
+    super(
+      `failed to unlink ${jsonlPath}: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = "RemoveFailedError";
+    this.sid = sid;
+    this.jsonlPath = jsonlPath;
+    this.cause = cause;
   }
 }
 

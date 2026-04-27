@@ -7,7 +7,11 @@ import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SessionManager, type CreateSessionOpts } from "./session-manager";
+import {
+  RemoveFailedError,
+  SessionManager,
+  type CreateSessionOpts,
+} from "./session-manager";
 import {
   Session,
   SessionNotReadyError,
@@ -697,11 +701,12 @@ app.get("/inbox", (c) => {
 });
 
 app.post("/sessions", async (c) => {
-  // Optional body: { resume_from?: string, workdir?: string }. No body /
-  // missing fields = a fresh session under the server's --workdir.
-  // resume_from is an oakridgeSid whose parent CC session should be
-  // inherited as context via --resume <parentCcSid> --fork-session, and
-  // ignores any workdir override (the parent's workdir is authoritative).
+  // Optional body: { resume_from?: string, workdir?: string, name?: string
+  // (≤80 chars) }. No body / missing fields = a fresh session under the
+  // server's --workdir with a server-generated name. resume_from is an
+  // oakridgeSid whose parent CC session should be inherited as context via
+  // --resume <parentCcSid> --fork-session, and ignores any workdir override
+  // (the parent's workdir is authoritative).
   let resumeFrom: string | null = null;
   let bodyWorkdir: string | null = null;
   let bodyName: string | null = null;
@@ -742,10 +747,16 @@ app.post("/sessions", async (c) => {
         if (typeof parsed.name !== "string") {
           return c.json({ error: "name must be a string" }, 400);
         }
-        if (parsed.name.length > 80) {
-          return c.json({ error: "name must be ≤ 80 chars" }, 400);
+        // Validate after trimming so leading/trailing whitespace can't
+        // push an otherwise-valid name past the cap. All-whitespace
+        // trims to empty, which manager.create()'s slug fallback
+        // handles the same as an omitted name, so we just store the
+        // trimmed value (possibly empty) and let create() decide.
+        const trimmedName = parsed.name.trim();
+        if (trimmedName.length > 80) {
+          return c.json({ error: "name must be ≤ 80 chars after trimming" }, 400);
         }
-        bodyName = parsed.name;
+        bodyName = trimmedName;
       }
     }
   } catch {
@@ -912,14 +923,35 @@ app.delete("/sessions/:sid", async (c) => {
   // it, the existing abort-only semantic is preserved so the PWA's Stop
   // button keeps the ended transcript visible. Treat any non-falsy value
   // as truthy ("1", "true", "yes") to match common URL convention.
-  const purgeParam = c.req.query("purge");
+  // Lowercase once so falsy variants like ?purge=False / FALSE / NO are
+  // recognized — without this, mixed-case spellings would unexpectedly
+  // trigger a hard delete.
+  const purgeParam = c.req.query("purge")?.toLowerCase();
   const purge =
     purgeParam !== undefined &&
     purgeParam !== "" &&
     purgeParam !== "0" &&
-    purgeParam !== "false";
+    purgeParam !== "false" &&
+    purgeParam !== "no" &&
+    purgeParam !== "off";
   if (purge) {
-    const removed = await manager.remove(sid);
+    let removed: boolean;
+    try {
+      removed = await manager.remove(sid);
+    } catch (err) {
+      if (err instanceof RemoveFailedError) {
+        // unlink failed for a non-ENOENT reason (EACCES/EBUSY/EIO/etc).
+        // Surface as 500 so the client doesn't see a misleading
+        // "removed:true" — the transcript may still be on disk and would
+        // reappear after restart. The full message (with JSONL path) is
+        // logged server-side; the response body intentionally omits the
+        // path since the server runs on 0.0.0.0 (tailnet) and we don't
+        // want to disclose filesystem layout to anyone who can hit it.
+        console.error(`cc-deck: ${err.message}`);
+        return c.json({ error: "purge failed" }, 500);
+      }
+      throw err;
+    }
     if (!removed) return c.json({ error: "unknown session" }, 404);
     return c.json({ ok: true, removed: true });
   }
