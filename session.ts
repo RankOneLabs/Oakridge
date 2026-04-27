@@ -37,6 +37,7 @@ export interface SessionCallbacks {
 export interface SessionOpts {
   oakridgeSid: string;
   workdir: string;
+  name: string;
   sessionsDir: string;
   parentCcSid?: string;
   parentOakridgeSid?: string;
@@ -60,6 +61,7 @@ export interface ResultUsage {
 
 export interface SessionSnapshot {
   sid: string;
+  name: string;
   workdir: string;
   status: SessionStatus;
   createdAt: string;
@@ -92,6 +94,7 @@ export async function readJsonlOrEmpty(path: string): Promise<string> {
 export class Session {
   readonly oakridgeSid: string;
   readonly workdir: string;
+  readonly name: string;
   readonly jsonlPath: string;
   readonly parentCcSid: string | null;
   readonly parentOakridgeSid: string | null;
@@ -130,6 +133,7 @@ export class Session {
   constructor(opts: SessionOpts) {
     this.oakridgeSid = opts.oakridgeSid;
     this.workdir = opts.workdir;
+    this.name = opts.name;
     this.jsonlPath = join(opts.sessionsDir, `${opts.oakridgeSid}.jsonl`);
     this.parentCcSid = opts.parentCcSid ?? null;
     this.parentOakridgeSid = opts.parentOakridgeSid ?? null;
@@ -168,6 +172,7 @@ export class Session {
   snapshot(): SessionSnapshot {
     return {
       sid: this.oakridgeSid,
+      name: this.name,
       workdir: this.workdir,
       status: this._status,
       createdAt: this.createdAt,
@@ -265,6 +270,7 @@ export class Session {
     await this.emit("session_started", {
       command: cmd.cmd,
       workdir: this.workdir,
+      name: this.name,
       sessionId: this.oakridgeSid,
       parentCcSid: this.parentCcSid,
       parentOakridgeSid: this.parentOakridgeSid,

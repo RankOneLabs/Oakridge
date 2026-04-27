@@ -28,6 +28,7 @@ interface ResultUsage {
 
 interface SessionSnapshot {
   sid: string;
+  name: string;
   workdir: string;
   status: SessionStatus;
   createdAt: string;
@@ -41,9 +42,34 @@ interface SessionSnapshot {
   lastResultUsage: ResultUsage | null;
 }
 
+const SLUG_ADJ = [
+  "amber","azure","brave","bright","calm","clever","cobalt","cozy","crimson",
+  "eager","gentle","happy","ivory","jade","kind","lively","mellow","onyx",
+  "plucky","quiet","quick","sage","sly","spry","teal","tidy","witty","zesty",
+];
+const SLUG_NOUN = [
+  "badger","cedar","fern","fox","hazel","heron","ivy","juniper","kelp",
+  "laurel","lynx","maple","moss","newt","oak","otter","owl","pika","pine",
+  "quokka","raven","reed","sumac","tern","thistle","violet","weasel","wren",
+];
+function generateSlug(): string {
+  const a = SLUG_ADJ[Math.floor(Math.random() * SLUG_ADJ.length)];
+  const n = SLUG_NOUN[Math.floor(Math.random() * SLUG_NOUN.length)];
+  const num = Math.floor(Math.random() * 90) + 10;
+  return `${a}-${n}-${num}`;
+}
+
+function workdirBasename(p: string): string {
+  if (!p) return "";
+  const trimmed = p.replace(/\/+$/, "");
+  const parts = trimmed.split("/");
+  return parts[parts.length - 1] || trimmed;
+}
+
 type InboxDelta =
   | { type: "session_created"; session: SessionSnapshot }
   | { type: "session_ended"; sid: string }
+  | { type: "session_removed"; sid: string }
   | { type: "status_changed"; sid: string; status: SessionStatus }
   | { type: "pending_count_changed"; sid: string; count: number }
   | { type: "last_activity_changed"; sid: string; ts: string }
@@ -237,9 +263,18 @@ function useInbox(): InboxState {
           return next;
         });
       }
+      if (delta.type === "session_removed") {
+        setInMemorySids((prev) => {
+          if (!prev.has(delta.sid)) return prev;
+          const next = new Set(prev);
+          next.delete(delta.sid);
+          return next;
+        });
+      }
       // session_ended keeps the sid in inMemorySids: ended sessions linger
       // in the manager map (and stream/events still work against them)
-      // until the server process exits.
+      // until the server process exits. session_removed (purge) is what
+      // actually drops the entry.
     });
 
     return () => {
@@ -263,6 +298,10 @@ function applyDelta(
     case "session_ended": {
       const s = next.get(delta.sid);
       if (s) next.set(delta.sid, { ...s, status: "ended", pendingCount: 0 });
+      break;
+    }
+    case "session_removed": {
+      next.delete(delta.sid);
       break;
     }
     case "status_changed": {
@@ -367,6 +406,12 @@ function SessionListView({
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [workdirInput, setWorkdirInput] = useState("");
   const [workdirTouched, setWorkdirTouched] = useState(false);
+  const [nameInput, setNameInput] = useState("");
+  // Generated once per mount so the placeholder is stable while the operator
+  // is filling out the form (otherwise it would flicker on every re-render).
+  // Submit uses the current placeholder if name field is empty, so what they
+  // see is what they get.
+  const [namePlaceholder, setNamePlaceholder] = useState(generateSlug);
   const sorted = useMemo(() => sortSessions(sessions), [sessions]);
 
   // Prefill the workdir input with the server default once /config resolves,
@@ -388,7 +433,7 @@ function SessionListView({
   async function startSession(resumeFrom?: string) {
     if (pending) return;
     setPendingError(null);
-    const body: { resume_from?: string; workdir?: string } = {};
+    const body: { resume_from?: string; workdir?: string; name?: string } = {};
     if (resumeFrom) {
       body.resume_from = resumeFrom;
     } else {
@@ -398,6 +443,8 @@ function SessionListView({
         return;
       }
       body.workdir = trimmed;
+      const nameTrim = nameInput.trim();
+      body.name = nameTrim || namePlaceholder;
     }
     setPending(true);
     try {
@@ -424,6 +471,10 @@ function SessionListView({
       // the stream falls back to one-shot /events for the first ~100ms.
       onHydrateSession(snap);
       onSelect(snap.sid);
+      // Reset name field + reroll slug so a follow-up "+ New" gets a fresh
+      // suggestion, not a recycled one.
+      setNameInput("");
+      setNamePlaceholder(generateSlug());
     } catch (err) {
       setPendingError(err instanceof Error ? err.message : "network error");
     } finally {
@@ -473,6 +524,20 @@ function SessionListView({
             autoCapitalize="off"
             autoCorrect="off"
             aria-label="Workdir for new session"
+          />
+          <input
+            type="text"
+            className="new-session-name"
+            placeholder={namePlaceholder}
+            value={nameInput}
+            onChange={(e) => setNameInput(e.target.value)}
+            disabled={pending}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            maxLength={80}
+            aria-label="Optional session name"
+            title="Leave blank to use the generated name shown as placeholder"
           />
           <button
             type="submit"
@@ -530,6 +595,32 @@ function SessionRow({
 }) {
   const relative = useRelativeTime(snapshot.lastActivityTs);
   const canResume = snapshot.status === "ended";
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  // Auto-clear the confirm-pending state after a few seconds so a stray
+  // first tap doesn't leave a primed Remove button waiting indefinitely.
+  useEffect(() => {
+    if (!confirmRemove) return;
+    const t = setTimeout(() => setConfirmRemove(false), 4000);
+    return () => clearTimeout(t);
+  }, [confirmRemove]);
+
+  async function remove() {
+    if (removing) return;
+    setRemoving(true);
+    try {
+      await fetch(`/sessions/${encodeURIComponent(snapshot.sid)}?purge=true`, {
+        method: "DELETE",
+      });
+      // Server broadcasts session_removed; the inbox handler drops the row.
+      // No optimistic UI here — if the request failed silently the row
+      // simply stays put and the operator can retry.
+    } finally {
+      setRemoving(false);
+      setConfirmRemove(false);
+    }
+  }
+
   return (
     <li className="session-row-li">
       <button
@@ -541,8 +632,8 @@ function SessionRow({
           <span className={`session-row-status session-row-status-${snapshot.status}`}>
             {snapshot.status}
           </span>
-          <span className="session-row-sid" title={snapshot.sid}>
-            {snapshot.sid.slice(0, 8)}
+          <span className="session-row-name" title={snapshot.sid}>
+            {snapshot.name || snapshot.sid.slice(0, 8)}
           </span>
           {snapshot.pendingCount > 0 && (
             <span className="session-row-pending" aria-label={`${snapshot.pendingCount} pending approvals`}>
@@ -573,6 +664,30 @@ function SessionRow({
           Resume
         </button>
       )}
+      <button
+        type="button"
+        className={`btn-remove${confirmRemove ? " is-confirming" : ""}`}
+        disabled={removing}
+        title={
+          snapshot.status === "live"
+            ? "Aborts the live subprocess and deletes the transcript file."
+            : "Deletes the transcript file."
+        }
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!confirmRemove) {
+            setConfirmRemove(true);
+            return;
+          }
+          void remove();
+        }}
+      >
+        {removing
+          ? "removing…"
+          : confirmRemove
+            ? "tap to confirm"
+            : "Remove"}
+      </button>
     </li>
   );
 }
@@ -1086,11 +1201,21 @@ function SessionTopBar({
         </span>
       )}
       <span
-        className="session-id"
-        title={`session ${sid}`}
-        aria-label={`Session ID ${sid}`}
+        className="session-label"
+        title={
+          snapshot
+            ? `${snapshot.name}\n${snapshot.workdir}\nsid ${sid}`
+            : `session ${sid}`
+        }
       >
-        {sid.slice(0, 8)}
+        <span className="session-label-name">
+          {snapshot?.name || sid.slice(0, 8)}
+        </span>
+        {snapshot?.workdir && (
+          <span className="session-label-workdir">
+            {workdirBasename(snapshot.workdir)}
+          </span>
+        )}
       </span>
     </header>
   );
@@ -1989,6 +2114,25 @@ function InputBox({
     <div className="input-bar">
       {error && <div className="input-error">error: {error}</div>}
       <div className="input-bar-row">
+        {canStop && (
+          <button
+            type="button"
+            className={`btn-stop ${confirmStop ? "is-confirming" : ""}`}
+            onClick={() => {
+              if (stopping) return;
+              if (confirmStop) {
+                void stop();
+              } else {
+                setConfirmStop(true);
+              }
+            }}
+            onBlur={() => setConfirmStop(false)}
+            disabled={stopping}
+            title="Kills the CC subprocess. Resume from the ended banner to fork a new session with the same context."
+          >
+            {stopping ? "stopping…" : confirmStop ? "confirm" : "Stop"}
+          </button>
+        )}
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -2010,34 +2154,9 @@ function InputBox({
           Send
         </button>
       </div>
-      <div className="input-bar-meta">
-        <span className="input-hint">
-          Enter to send · Shift+Enter for newline
-        </span>
-        {canStop && (
-          <button
-            type="button"
-            className={`btn-stop ${confirmStop ? "is-confirming" : ""}`}
-            onClick={() => {
-              if (stopping) return;
-              if (confirmStop) {
-                void stop();
-              } else {
-                setConfirmStop(true);
-              }
-            }}
-            onBlur={() => setConfirmStop(false)}
-            disabled={stopping}
-            title="Kills the CC subprocess. Resume from the ended banner to fork a new session with the same context."
-          >
-            {stopping
-              ? "stopping…"
-              : confirmStop
-                ? "tap again to stop"
-                : "Stop"}
-          </button>
-        )}
-      </div>
+      <span className="input-hint">
+        Enter to send · Shift+Enter for newline
+      </span>
     </div>
   );
 }

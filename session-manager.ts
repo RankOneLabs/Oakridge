@@ -1,4 +1,4 @@
-import { readdir } from "node:fs/promises";
+import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -27,6 +27,7 @@ export interface SessionManagerOpts {
 
 export interface CreateSessionOpts {
   workdir: string;
+  name?: string;
   parentCcSid?: string;
   parentOakridgeSid?: string;
 }
@@ -39,6 +40,7 @@ export interface CreateSessionOpts {
 export type InboxDelta =
   | { type: "session_created"; session: SessionSnapshot }
   | { type: "session_ended"; sid: string }
+  | { type: "session_removed"; sid: string }
   | { type: "status_changed"; sid: string; status: SessionStatus }
   | { type: "pending_count_changed"; sid: string; count: number }
   | { type: "last_activity_changed"; sid: string; ts: string }
@@ -74,15 +76,32 @@ export class SessionManager {
     string,
     ReturnType<typeof setTimeout>
   >();
+  /**
+   * Lazy cache of the archived-snapshot scan. Populated on first call to
+   * listArchivedSnapshots() and reused thereafter — within a single
+   * server run, archived sessions are immutable (in-memory ones are
+   * filtered out, and a session never re-enters the archived set after
+   * starting in memory). Only remove() invalidates an entry.
+   *
+   * null = not yet loaded; non-null = loaded once, value is authoritative.
+   */
+  private archivedSnapshotCache: Map<string, SessionSnapshot> | null = null;
 
   constructor(opts: SessionManagerOpts) {
     this.opts = opts;
   }
 
   async create(opts: CreateSessionOpts): Promise<Session> {
+    const oakridgeSid = newSessionId();
+    // Server-side fallback so curl-without-name still produces a usable
+    // human-readable name. Real client always sends one (its placeholder
+    // value); this only fires for direct API hits.
+    const name =
+      opts.name && opts.name.trim() ? opts.name.trim() : `session-${oakridgeSid.slice(0, 8)}`;
     const session = new Session({
-      oakridgeSid: newSessionId(),
+      oakridgeSid,
       workdir: opts.workdir,
+      name,
       sessionsDir: this.opts.sessionsDir,
       parentCcSid: opts.parentCcSid,
       parentOakridgeSid: opts.parentOakridgeSid,
@@ -171,11 +190,28 @@ export class SessionManager {
    * aren't currently in memory — i.e. sessions from prior server runs that
    * completed before restart. Live/ended-in-memory sessions are filtered
    * out here so the caller can merge these with listSnapshots() without
-   * duplicates. Scans the sessions directory at call time; fine at the
-   * scale we expect (<~100 sessions), and keeps the happy path free of a
-   * sidecar index that'd have to be kept in sync.
+   * duplicates.
+   *
+   * First call scans the sessions directory and parses each JSONL; result
+   * is cached for the lifetime of the server process. Subsequent calls
+   * return cached snapshots without I/O. Only remove() can invalidate an
+   * entry. With ~20 archived sessions, this cuts a 100ms+ /sessions call
+   * to <1ms after the first hit, which matters for PWA cold start where
+   * multiple tabs all fetch the list at once.
    */
   async listArchivedSnapshots(): Promise<SessionSnapshot[]> {
+    if (this.archivedSnapshotCache !== null) {
+      // Cache may contain entries for sessions that have since started in
+      // memory (extremely rare — would require a sid collision or a
+      // server-on-server scenario), so filter on read just like the cold
+      // path does.
+      const out: SessionSnapshot[] = [];
+      for (const [sid, snap] of this.archivedSnapshotCache) {
+        if (!this.sessions.has(sid)) out.push(snap);
+      }
+      return out;
+    }
+    const cache = new Map<string, SessionSnapshot>();
     let entries: string[];
     try {
       entries = await readdir(this.opts.sessionsDir);
@@ -186,20 +222,25 @@ export class SessionManager {
         "code" in err &&
         (err as { code: string }).code === "ENOENT"
       ) {
+        // Empty cache is still a valid populated state — sessionsDir
+        // missing is a normal cold start and shouldn't force a re-scan.
+        this.archivedSnapshotCache = cache;
         return [];
       }
       throw err;
     }
-    const results: SessionSnapshot[] = [];
     for (const name of entries) {
       if (!name.endsWith(".jsonl")) continue;
       const sid = name.slice(0, -".jsonl".length);
       if (this.sessions.has(sid)) continue;
       const jsonlPath = join(this.opts.sessionsDir, name);
       const snap = await loadArchivedSnapshot(sid, jsonlPath);
-      if (snap) results.push(snap);
+      if (snap) cache.set(sid, snap);
     }
-    return results;
+    this.archivedSnapshotCache = cache;
+    const out: SessionSnapshot[] = [];
+    for (const snap of cache.values()) out.push(snap);
+    return out;
   }
 
   /**
@@ -226,6 +267,65 @@ export class SessionManager {
     const session = this.sessions.get(oakridgeSid);
     if (!session) return -1;
     return session.abort();
+  }
+
+  /**
+   * Hard-deletes a session: aborts it if live, drops it from the in-memory
+   * map, removes its JSONL from disk, and broadcasts session_removed.
+   * Works on archived-only sids too (not in memory) — those just delete the
+   * JSONL. Returns true if anything was removed (file or map entry), false
+   * if the sid was unknown to both.
+   *
+   * The abort happens BEFORE unlink so an active jsonlWriter doesn't race
+   * with the deletion: finalize() drains and ends the writer first, then
+   * we unlink.
+   */
+  async remove(oakridgeSid: string): Promise<boolean> {
+    const session = this.sessions.get(oakridgeSid);
+    let touched = false;
+    if (session) {
+      // abort() is idempotent on already-ended sessions, so this is safe
+      // for both live and ended map entries.
+      try {
+        await session.abort();
+      } catch (err) {
+        console.error(
+          `cc-deck: abort during remove failed for ${oakridgeSid}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      this.sessions.delete(oakridgeSid);
+      this.clearActivityTimer(oakridgeSid);
+      touched = true;
+    }
+    const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
+    // Invalidate the archived cache for this sid up front so a concurrent
+    // listArchivedSnapshots() can't repopulate after the unlink.
+    if (this.archivedSnapshotCache?.delete(oakridgeSid)) touched = true;
+    try {
+      await unlink(jsonlPath);
+      touched = true;
+    } catch (err) {
+      // ENOENT is fine — the file may have been an in-memory-only
+      // session that never wrote anything, or already removed.
+      if (
+        !err ||
+        typeof err !== "object" ||
+        !("code" in err) ||
+        (err as { code: string }).code !== "ENOENT"
+      ) {
+        console.error(
+          `cc-deck: unlink failed for ${jsonlPath}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    if (touched) {
+      this.broadcastDelta({ type: "session_removed", sid: oakridgeSid });
+    }
+    return touched;
   }
 
   /**
@@ -340,6 +440,7 @@ async function loadArchivedSnapshot(
   if (!contents) return null;
   let createdAt: string | null = null;
   let workdir = "";
+  let name = "";
   let ccSid: string | null = null;
   let parentCcSid: string | null = null;
   let parentOakridgeSid: string | null = null;
@@ -361,6 +462,7 @@ async function loadArchivedSnapshot(
       case "session_started": {
         if (createdAt === null) createdAt = evt.ts;
         if (typeof payload.workdir === "string") workdir = payload.workdir;
+        if (typeof payload.name === "string") name = payload.name;
         if (typeof payload.parentCcSid === "string") {
           parentCcSid = payload.parentCcSid;
         }
@@ -395,6 +497,7 @@ async function loadArchivedSnapshot(
   if (!createdAt) return null;
   return {
     sid,
+    name: name || `session-${sid.slice(0, 8)}`,
     workdir,
     // If the file is on disk and not in memory, by definition the session
     // is no longer running. A more sophisticated check would look for a

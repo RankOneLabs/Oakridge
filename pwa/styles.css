@@ -234,13 +234,36 @@ body {
   cursor: not-allowed;
 }
 
-.session-id {
-  /* Shown only at desktop widths — below that, screen real estate is at a
-     premium and the id isn't operator-actionable info. */
-  display: none;
+.session-label {
+  /* Pushed all the way right by margin-left:auto so it sits opposite the
+     back button — gives the operator a constant "where am I" anchor on
+     both mobile and desktop. Truncates with ellipsis when crowded. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-left: auto;
+  min-width: 0;
+  max-width: 50%;
+  line-height: 1.15;
+  overflow: hidden;
+}
+.session-label-name {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.session-label-workdir {
   color: var(--text-session);
   font-family: "SF Mono", Menlo, monospace;
-  font-size: 0.75rem;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .input-hint {
@@ -717,10 +740,12 @@ body {
 
 .new-session-form {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.4rem;
   align-items: stretch;
 }
-.new-session-workdir {
+.new-session-workdir,
+.new-session-name {
   flex: 1;
   min-width: 0;
   background: var(--bg-surface);
@@ -732,11 +757,21 @@ body {
   font: inherit;
   font-size: 0.9rem;
 }
-.new-session-workdir:focus {
+.new-session-workdir {
+  flex-basis: 100%;
+}
+.new-session-name {
+  flex-basis: 0;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+}
+.new-session-workdir:focus,
+.new-session-name:focus {
   outline: none;
   border-color: var(--accent-blue);
 }
-.new-session-workdir::placeholder {
+.new-session-workdir::placeholder,
+.new-session-name::placeholder {
   color: var(--text-fainter);
 }
 
@@ -769,17 +804,20 @@ body {
 .session-row-li {
   position: relative;
 }
-/* Make room on the right side of the row so the Resume button can sit
-   absolutely-positioned without overlapping the workdir text. The
-   absolute-positioning keeps the button out of the row's click target
-   while still visually attached to the row. */
+/* Both action buttons (Resume, Remove) are absolutely positioned on the
+   right so they don't sit inside the row's click target. Remove is always
+   rendered; Resume only when ended. Rows reserve space for Remove always,
+   plus extra when Resume is also present. */
+.session-row-li .session-row {
+  padding-right: 6.25rem;
+}
 .session-row-li:has(.btn-resume) .session-row {
-  padding-right: 5.5rem;
+  padding-right: 11rem;
 }
 .btn-resume {
   position: absolute;
   top: 50%;
-  right: 0.75rem;
+  right: 6.25rem;
   transform: translateY(-50%);
   background: var(--accent-blue);
   color: #ffffff;
@@ -799,6 +837,40 @@ body {
   filter: brightness(1.08);
 }
 .btn-resume:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* Outlined danger affordance, sits at the row's far right. Two-tap
+   confirm — first tap primes (`.is-confirming` paints it solid red),
+   second tap fires the DELETE. Prevents a stray swipe from nuking work. */
+.btn-remove {
+  position: absolute;
+  top: 50%;
+  right: 0.75rem;
+  transform: translateY(-50%);
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  min-height: 44px;
+  white-space: nowrap;
+}
+.btn-remove:hover:not(:disabled) {
+  color: var(--danger-fg);
+  border-color: var(--danger-fg);
+}
+.btn-remove.is-confirming {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  border-color: var(--danger-fg);
+  font-weight: 600;
+}
+.btn-remove:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -859,10 +931,14 @@ body {
   background: var(--bg-code);
   color: var(--text-muted);
 }
-.session-row-sid {
-  font-family: "SF Mono", Menlo, monospace;
+.session-row-name {
   color: var(--text-secondary);
-  font-size: 0.85rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .session-row-pending {
   background: var(--permission-bg);
@@ -1000,38 +1076,38 @@ body {
   cursor: not-allowed;
 }
 
-.input-bar-meta {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.btn-stop {
+/* Selector is `.input-bar button.btn-stop` (specificity 0,2,1) so it wins
+   over the generic `.input-bar button` (0,1,1) Send-button styling. Without
+   the bump, the Stop button inherits Send's solid blue and looks like a
+   second Send instead of an outlined danger affordance. */
+.input-bar button.btn-stop {
   background: transparent;
   color: var(--text-muted);
   border: 1px solid var(--border-muted);
   border-radius: 6px;
-  padding: 0.4rem 0.75rem;
+  padding: 0 0.75rem;
   font: inherit;
-  font-size: 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 500;
   cursor: pointer;
   min-height: 44px;
   white-space: nowrap;
 }
-.btn-stop:hover:not(:disabled) {
+.input-bar button.btn-stop:hover:not(:disabled) {
   color: var(--danger-fg);
   border-color: var(--danger-fg);
+  background: transparent;
 }
-.btn-stop.is-confirming {
+.input-bar button.btn-stop.is-confirming {
   background: var(--danger-bg);
   color: var(--danger-fg);
   border-color: var(--danger-fg);
   font-weight: 600;
 }
-.btn-stop:disabled {
+.input-bar button.btn-stop:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+  background: transparent;
 }
 
 /* Optimistic user bubble shown immediately on send. Visually echoes the
@@ -1140,8 +1216,5 @@ body {
   }
   .input-hint {
     display: block;
-  }
-  .session-id {
-    display: inline;
   }
 }

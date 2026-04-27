@@ -704,6 +704,7 @@ app.post("/sessions", async (c) => {
   // ignores any workdir override (the parent's workdir is authoritative).
   let resumeFrom: string | null = null;
   let bodyWorkdir: string | null = null;
+  let bodyName: string | null = null;
   // Read raw text first so we can distinguish "no body" (treat as no
   // options, preserves the old POST /sessions behavior) from "bad body"
   // (400). Using c.req.json() with an inner .catch() would silently
@@ -720,7 +721,11 @@ app.post("/sessions", async (c) => {
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
         return c.json({ error: "json body must be an object" }, 400);
       }
-      const parsed = raw as { resume_from?: unknown; workdir?: unknown };
+      const parsed = raw as {
+        resume_from?: unknown;
+        workdir?: unknown;
+        name?: unknown;
+      };
       if (parsed.resume_from !== undefined) {
         if (typeof parsed.resume_from !== "string") {
           return c.json({ error: "resume_from must be a string" }, 400);
@@ -732,6 +737,15 @@ app.post("/sessions", async (c) => {
           return c.json({ error: "workdir must be a string" }, 400);
         }
         bodyWorkdir = parsed.workdir;
+      }
+      if (parsed.name !== undefined) {
+        if (typeof parsed.name !== "string") {
+          return c.json({ error: "name must be a string" }, 400);
+        }
+        if (parsed.name.length > 80) {
+          return c.json({ error: "name must be ≤ 80 chars" }, 400);
+        }
+        bodyName = parsed.name;
       }
     }
   } catch {
@@ -747,7 +761,7 @@ app.post("/sessions", async (c) => {
     const target = resolve(bodyWorkdir ?? workdir);
     const err = await validateWorkdir(target);
     if (err) return c.json({ error: err }, 400);
-    spawnOpts = { workdir: target };
+    spawnOpts = { workdir: target, name: bodyName ?? undefined };
   } else {
     if (!isValidSid(resumeFrom)) {
       return c.json({ error: "invalid resume_from" }, 400);
@@ -787,6 +801,7 @@ app.post("/sessions", async (c) => {
       // resumed subprocess still needs parent's cwd to match what the
       // transcript assumes.
       workdir: parentWorkdir,
+      name: bodyName ?? undefined,
       parentCcSid: parentInfo.parentCcSid,
       parentOakridgeSid: resumeFrom,
     };
@@ -892,6 +907,22 @@ async function resolveResumeParent(sid: string): Promise<ResumeParentResult> {
 
 app.delete("/sessions/:sid", async (c) => {
   const sid = c.req.param("sid");
+  if (!isValidSid(sid)) return c.json({ error: "invalid sid" }, 400);
+  // ?purge=true is a hard delete (drop map entry + delete JSONL). Without
+  // it, the existing abort-only semantic is preserved so the PWA's Stop
+  // button keeps the ended transcript visible. Treat any non-falsy value
+  // as truthy ("1", "true", "yes") to match common URL convention.
+  const purgeParam = c.req.query("purge");
+  const purge =
+    purgeParam !== undefined &&
+    purgeParam !== "" &&
+    purgeParam !== "0" &&
+    purgeParam !== "false";
+  if (purge) {
+    const removed = await manager.remove(sid);
+    if (!removed) return c.json({ error: "unknown session" }, 404);
+    return c.json({ ok: true, removed: true });
+  }
   const session = manager.get(sid);
   if (!session) return c.json({ error: "unknown session" }, 404);
   const code = await session.abort();
