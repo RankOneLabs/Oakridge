@@ -332,13 +332,26 @@ export class SessionManager {
    *     reaching it).
    */
   async remove(oakridgeSid: string): Promise<boolean> {
+    // Make sure the archived cache has finished populating (or definitively
+    // failed to populate) before we mutate any state. Without this, a
+    // listArchivedSnapshots() call landing AFTER remove enters can start
+    // a fresh scan that reads the JSONL we're about to unlink and writes
+    // it back into the cache after our cache.delete() — resurrecting a
+    // purged sid. Round 1 only handled the "scan already in flight" case;
+    // this also handles "no scan yet, but one could start mid-remove".
+    if (this.archivedSnapshotCache === null && this.archivedScanPromise === null) {
+      this.archivedScanPromise = this.populateArchivedCache().finally(() => {
+        this.archivedScanPromise = null;
+      });
+    }
     if (this.archivedScanPromise) {
       try {
         await this.archivedScanPromise;
       } catch {
         // Scan failure is the scan's problem; we still want to attempt
         // the remove. If the cache is null after this, the cache eviction
-        // step below is a no-op.
+        // step below is a no-op (and a later list call will retry the
+        // scan, which won't see this sid because we'll have unlinked it).
       }
     }
     const session = this.sessions.get(oakridgeSid);
@@ -357,9 +370,12 @@ export class SessionManager {
     }
     const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
     // Distinct from "unlink resolved without throwing": only true when
-    // unlink actually deleted a file (ENOENT does NOT set this). Used
-    // below for the cache-null edge case so a bogus sid that ENOENTs
-    // can't be reported as a successful removal.
+    // unlink actually deleted a file (ENOENT does NOT set this). Seeded
+    // into `removed` below so any real file deletion counts as removal,
+    // even when the sid wasn't in the live map AND wasn't in the cache
+    // (e.g. an archived JSONL that loadArchivedSnapshot() skipped because
+    // it was empty/malformed). ENOENT keeps it false so a typo'd sid
+    // returns `removed: false` rather than a false-positive 200.
     let unlinkDeletedFile = false;
     try {
       await unlink(jsonlPath);
@@ -381,22 +397,13 @@ export class SessionManager {
     }
     // Past this point: unlink succeeded OR ENOENT (file already absent).
     // Reflect the new state in our in-memory bookkeeping.
-    let removed = false;
+    let removed = unlinkDeletedFile;
     if (session) {
       this.sessions.delete(oakridgeSid);
       this.clearActivityTimer(oakridgeSid);
       removed = true;
     }
     if (this.archivedSnapshotCache?.delete(oakridgeSid)) removed = true;
-    if (!removed && unlinkDeletedFile && this.archivedSnapshotCache === null) {
-      // First-call edge: cache hasn't been populated yet, sid wasn't in
-      // memory, but unlink really removed a file from disk — treat that
-      // as a successful removal so the operator's Remove click on an
-      // archived-on-disk row right after server boot is honored. ENOENT
-      // is intentionally excluded so a typo'd sid doesn't get a
-      // false-positive "removed" response.
-      removed = true;
-    }
     if (removed) {
       this.broadcastDelta({ type: "session_removed", sid: oakridgeSid });
     }
