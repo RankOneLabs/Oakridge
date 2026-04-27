@@ -332,32 +332,27 @@ export class SessionManager {
    *     reaching it).
    */
   async remove(oakridgeSid: string): Promise<boolean> {
-    // Make sure the archived cache has finished populating (or definitively
-    // failed to populate) before we mutate any state. Without this, a
-    // listArchivedSnapshots() call landing AFTER remove enters can start
-    // a fresh scan that reads the JSONL we're about to unlink and writes
-    // it back into the cache after our cache.delete() — resurrecting a
-    // purged sid. Round 1 only handled the "scan already in flight" case;
-    // this also handles "no scan yet, but one could start mid-remove".
+    // Trigger the archived scan up front (if it hasn't run yet and isn't
+    // already in flight) but DON'T await it here — the scan needs to be
+    // resolved before we touch the cache, but we don't want it blocking
+    // the live-session abort below. Without this trigger, a
+    // listArchivedSnapshots() call landing mid-remove could start a fresh
+    // scan that reads the JSONL we're about to unlink and writes it back
+    // into the cache after our cache.delete() — resurrecting a purged
+    // sid. Kicking it off here ensures any later list call joins the same
+    // promise instead of starting a new one.
     if (this.archivedSnapshotCache === null && this.archivedScanPromise === null) {
       this.archivedScanPromise = this.populateArchivedCache().finally(() => {
         this.archivedScanPromise = null;
       });
     }
-    if (this.archivedScanPromise) {
-      try {
-        await this.archivedScanPromise;
-      } catch {
-        // Scan failure is the scan's problem; we still want to attempt
-        // the remove. If the cache is null after this, the cache eviction
-        // step below is a no-op (and a later list call will retry the
-        // scan, which won't see this sid because we'll have unlinked it).
-      }
-    }
     const session = this.sessions.get(oakridgeSid);
     if (session) {
       // abort() is idempotent on already-ended sessions, so this is safe
-      // for both live and ended map entries.
+      // for both live and ended map entries. Run BEFORE the scan-await so
+      // a Remove tap on a live session kills the subprocess immediately
+      // instead of waiting ~130ms for the cold archived scan to finish.
+      // The scan still runs in parallel; we await it below.
       try {
         await session.abort();
       } catch (err) {
@@ -366,6 +361,20 @@ export class SessionManager {
             err instanceof Error ? err.message : String(err)
           }`,
         );
+      }
+    }
+    // Now resolve the scan promise (which has been running in parallel
+    // with the abort above). After this we know the cache is either
+    // populated or definitively failed to populate, so the cache.delete()
+    // below can't be undone by a late-completing scan.
+    if (this.archivedScanPromise) {
+      try {
+        await this.archivedScanPromise;
+      } catch {
+        // Scan failure is the scan's problem; we still want to attempt
+        // the remove. If the cache is null after this, the cache eviction
+        // step below is a no-op (and a later list call will retry the
+        // scan, which won't see this sid because we'll have unlinked it).
       }
     }
     const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
@@ -494,10 +503,10 @@ export class SessionManager {
 }
 
 /**
- * Thrown by SessionManager.remove() when the JSONL exists on disk but
- * unlink fails for any reason other than ENOENT. The HTTP route handler
- * catches this and returns a 500 so the client doesn't see a misleading
- * "removed" success while the transcript is still present. ENOENT is
+ * Thrown by SessionManager.remove() when unlinking the JSONL fails for
+ * any reason other than ENOENT. The HTTP route handler catches this and
+ * returns a 500 so the client doesn't see a misleading "removed"
+ * success while the transcript may still be present. ENOENT is
  * intentionally treated as success in remove() and never throws this.
  */
 export class RemoveFailedError extends Error {
