@@ -86,6 +86,15 @@ export class SessionManager {
    * null = not yet loaded; non-null = loaded once, value is authoritative.
    */
   private archivedSnapshotCache: Map<string, SessionSnapshot> | null = null;
+  /**
+   * Single-flight guard for the initial archived scan. While a scan is in
+   * flight this holds the populating promise; concurrent
+   * listArchivedSnapshots() callers await the same promise instead of each
+   * launching a duplicate readdir+parse pass, and remove() awaits it before
+   * mutating the cache so a delete arriving mid-scan can't race with the
+   * later cache write and resurrect a purged sid.
+   */
+  private archivedScanPromise: Promise<void> | null = null;
 
   constructor(opts: SessionManagerOpts) {
     this.opts = opts;
@@ -93,9 +102,10 @@ export class SessionManager {
 
   async create(opts: CreateSessionOpts): Promise<Session> {
     const oakridgeSid = newSessionId();
-    // Server-side fallback so curl-without-name still produces a usable
-    // human-readable name. Real client always sends one (its placeholder
-    // value); this only fires for direct API hits.
+    // Server-side fallback so requests without a usable name still produce a
+    // human-readable session name. `name` is optional in practice, and
+    // resume/default client flows may omit it, so this can run for normal
+    // client traffic as well as direct API hits.
     const name =
       opts.name && opts.name.trim() ? opts.name.trim() : `session-${oakridgeSid.slice(0, 8)}`;
     const session = new Session({
@@ -200,17 +210,33 @@ export class SessionManager {
    * multiple tabs all fetch the list at once.
    */
   async listArchivedSnapshots(): Promise<SessionSnapshot[]> {
-    if (this.archivedSnapshotCache !== null) {
-      // Cache may contain entries for sessions that have since started in
-      // memory (extremely rare — would require a sid collision or a
-      // server-on-server scenario), so filter on read just like the cold
-      // path does.
-      const out: SessionSnapshot[] = [];
-      for (const [sid, snap] of this.archivedSnapshotCache) {
-        if (!this.sessions.has(sid)) out.push(snap);
+    // Cold path: if the cache hasn't been populated yet, kick off (or
+    // join) the single-flight scan. All concurrent callers await the same
+    // promise so the readdir+parse pass runs once.
+    if (this.archivedSnapshotCache === null) {
+      if (this.archivedScanPromise === null) {
+        this.archivedScanPromise = this.populateArchivedCache().finally(() => {
+          this.archivedScanPromise = null;
+        });
       }
-      return out;
+      await this.archivedScanPromise;
     }
+    // Re-read after the (possible) await — populateArchivedCache may have
+    // populated the cache, or thrown without populating. In the latter
+    // case we return an empty list and the next call will retry.
+    const cache: Map<string, SessionSnapshot> | null = this.archivedSnapshotCache;
+    if (cache === null) return [];
+    // Filter on read so an entry whose sid has since started in memory
+    // (extremely rare — would require a sid collision or a server-on-server
+    // scenario) doesn't escape the cache and confuse callers.
+    const out: SessionSnapshot[] = [];
+    cache.forEach((snap, sid) => {
+      if (!this.sessions.has(sid)) out.push(snap);
+    });
+    return out;
+  }
+
+  private async populateArchivedCache(): Promise<void> {
     const cache = new Map<string, SessionSnapshot>();
     let entries: string[];
     try {
@@ -225,7 +251,7 @@ export class SessionManager {
         // Empty cache is still a valid populated state — sessionsDir
         // missing is a normal cold start and shouldn't force a re-scan.
         this.archivedSnapshotCache = cache;
-        return [];
+        return;
       }
       throw err;
     }
@@ -238,9 +264,6 @@ export class SessionManager {
       if (snap) cache.set(sid, snap);
     }
     this.archivedSnapshotCache = cache;
-    const out: SessionSnapshot[] = [];
-    for (const snap of cache.values()) out.push(snap);
-    return out;
   }
 
   /**
@@ -274,15 +297,35 @@ export class SessionManager {
    * map, removes its JSONL from disk, and broadcasts session_removed.
    * Works on archived-only sids too (not in memory) — those just delete the
    * JSONL. Returns true if anything was removed (file or map entry), false
-   * if the sid was unknown to both.
+   * if the sid was unknown to both. Throws RemoveFailedError if the JSONL
+   * exists but unlink fails for any reason other than ENOENT, so the route
+   * handler can return 5xx instead of advertising a successful purge while
+   * the transcript is still on disk.
    *
-   * The abort happens BEFORE unlink so an active jsonlWriter doesn't race
-   * with the deletion: finalize() drains and ends the writer first, then
-   * we unlink.
+   * Order of operations:
+   *  1. Wait for any in-flight archived scan so we operate on a consistent
+   *     cache state (otherwise a scan finishing after our cache.delete()
+   *     could resurrect this sid).
+   *  2. Abort the live subprocess if any (drains the jsonlWriter so the
+   *     unlink doesn't race with an open FD).
+   *  3. Unlink the JSONL. ENOENT = already gone = success. Any other error
+   *     is propagated; the in-memory map entry stays put so a retry can
+   *     finish the job.
+   *  4. On unlink success, evict from cache + drop map entry + broadcast.
+   *     Cache eviction explicitly does NOT contribute to the success
+   *     contract — only successful unlink does.
    */
   async remove(oakridgeSid: string): Promise<boolean> {
+    if (this.archivedScanPromise) {
+      try {
+        await this.archivedScanPromise;
+      } catch {
+        // Scan failure is the scan's problem; we still want to attempt
+        // the remove. If the cache is null after this, the cache eviction
+        // step below is a no-op.
+      }
+    }
     const session = this.sessions.get(oakridgeSid);
-    let touched = false;
     if (session) {
       // abort() is idempotent on already-ended sessions, so this is safe
       // for both live and ended map entries.
@@ -295,37 +338,52 @@ export class SessionManager {
           }`,
         );
       }
-      this.sessions.delete(oakridgeSid);
-      this.clearActivityTimer(oakridgeSid);
-      touched = true;
     }
     const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
-    // Invalidate the archived cache for this sid up front so a concurrent
-    // listArchivedSnapshots() can't repopulate after the unlink.
-    if (this.archivedSnapshotCache?.delete(oakridgeSid)) touched = true;
+    let unlinkSucceeded = false;
     try {
       await unlink(jsonlPath);
-      touched = true;
+      unlinkSucceeded = true;
     } catch (err) {
-      // ENOENT is fine — the file may have been an in-memory-only
-      // session that never wrote anything, or already removed.
-      if (
-        !err ||
-        typeof err !== "object" ||
-        !("code" in err) ||
-        (err as { code: string }).code !== "ENOENT"
-      ) {
-        console.error(
-          `cc-deck: unlink failed for ${jsonlPath}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as { code: string }).code
+          : null;
+      if (code === "ENOENT") {
+        // Already gone — equivalent to a successful unlink for our purposes
+        // (the file may have belonged to an in-memory-only session that
+        // never wrote anything, or a prior remove that landed mid-flight).
+        unlinkSucceeded = true;
+      } else {
+        // Real failure (EACCES, EBUSY, EIO, ...). Leave the in-memory map
+        // entry alone — the subprocess is already dead from the abort
+        // above, but the operator can still see a stuck row and retry.
+        // Do NOT broadcast session_removed; do NOT evict from cache.
+        throw new RemoveFailedError(oakridgeSid, jsonlPath, err);
       }
     }
-    if (touched) {
+    // Past this point we've confirmed the JSONL is gone. Now (and only
+    // now) reflect that in our in-memory state.
+    let removed = false;
+    if (session) {
+      this.sessions.delete(oakridgeSid);
+      this.clearActivityTimer(oakridgeSid);
+      removed = true;
+    }
+    if (this.archivedSnapshotCache?.delete(oakridgeSid)) removed = true;
+    if (unlinkSucceeded && !removed) {
+      // Sid wasn't in memory and wasn't in the archived cache, but we
+      // unlinked something (or ENOENT'd). Treat as removed if the cache
+      // hadn't been populated yet — common when the operator clicks
+      // Remove on an archived row and it's the very first list call.
+      // ENOENT-only with neither map nor cache hit means the sid was
+      // bogus and we touched nothing.
+      if (this.archivedSnapshotCache === null) removed = true;
+    }
+    if (removed) {
       this.broadcastDelta({ type: "session_removed", sid: oakridgeSid });
     }
-    return touched;
+    return removed;
   }
 
   /**
@@ -408,6 +466,31 @@ export class SessionManager {
       this.flushActivity(sid);
     }
     this.lastActivityFlushAt.delete(sid);
+  }
+}
+
+/**
+ * Thrown by SessionManager.remove() when the JSONL exists on disk but
+ * unlink fails for any reason other than ENOENT. The HTTP route handler
+ * catches this and returns a 500 so the client doesn't see a misleading
+ * "removed" success while the transcript is still present. ENOENT is
+ * intentionally treated as success in remove() and never throws this.
+ */
+export class RemoveFailedError extends Error {
+  readonly sid: string;
+  readonly jsonlPath: string;
+  // `cause` is on the ES2022 Error base; `override` keeps strict TS happy.
+  override readonly cause: unknown;
+  constructor(sid: string, jsonlPath: string, cause: unknown) {
+    super(
+      `failed to unlink ${jsonlPath}: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = "RemoveFailedError";
+    this.sid = sid;
+    this.jsonlPath = jsonlPath;
+    this.cause = cause;
   }
 }
 

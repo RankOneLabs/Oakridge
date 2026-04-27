@@ -7,7 +7,11 @@ import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SessionManager, type CreateSessionOpts } from "./session-manager";
+import {
+  RemoveFailedError,
+  SessionManager,
+  type CreateSessionOpts,
+} from "./session-manager";
 import {
   Session,
   SessionNotReadyError,
@@ -697,11 +701,12 @@ app.get("/inbox", (c) => {
 });
 
 app.post("/sessions", async (c) => {
-  // Optional body: { resume_from?: string, workdir?: string }. No body /
-  // missing fields = a fresh session under the server's --workdir.
-  // resume_from is an oakridgeSid whose parent CC session should be
-  // inherited as context via --resume <parentCcSid> --fork-session, and
-  // ignores any workdir override (the parent's workdir is authoritative).
+  // Optional body: { resume_from?: string, workdir?: string, name?: string
+  // (≤80 chars) }. No body / missing fields = a fresh session under the
+  // server's --workdir with a server-generated name. resume_from is an
+  // oakridgeSid whose parent CC session should be inherited as context via
+  // --resume <parentCcSid> --fork-session, and ignores any workdir override
+  // (the parent's workdir is authoritative).
   let resumeFrom: string | null = null;
   let bodyWorkdir: string | null = null;
   let bodyName: string | null = null;
@@ -919,7 +924,20 @@ app.delete("/sessions/:sid", async (c) => {
     purgeParam !== "0" &&
     purgeParam !== "false";
   if (purge) {
-    const removed = await manager.remove(sid);
+    let removed: boolean;
+    try {
+      removed = await manager.remove(sid);
+    } catch (err) {
+      if (err instanceof RemoveFailedError) {
+        // JSONL exists but unlink failed (EACCES/EBUSY/EIO/etc). Surface
+        // as 500 so the client doesn't see a misleading "removed:true" —
+        // the transcript is still on disk and would reappear after
+        // restart.
+        console.error(`cc-deck: ${err.message}`);
+        return c.json({ error: "purge failed", detail: err.message }, 500);
+      }
+      throw err;
+    }
     if (!removed) return c.json({ error: "unknown session" }, 404);
     return c.json({ ok: true, removed: true });
   }
