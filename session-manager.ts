@@ -212,14 +212,18 @@ export class SessionManager {
   async listArchivedSnapshots(): Promise<SessionSnapshot[]> {
     // Cold path: if the cache hasn't been populated yet, kick off (or
     // join) the single-flight scan. All concurrent callers await the same
-    // promise so the readdir+parse pass runs once.
+    // promise so the readdir+parse pass runs once. We swallow rejection
+    // here so a transient scan failure surfaces as an empty list rather
+    // than a 500 from /sessions?include=archived; the .finally() in the
+    // launch site already clears archivedScanPromise so the next call
+    // retries the scan from scratch.
     if (this.archivedSnapshotCache === null) {
       if (this.archivedScanPromise === null) {
         this.archivedScanPromise = this.populateArchivedCache().finally(() => {
           this.archivedScanPromise = null;
         });
       }
-      await this.archivedScanPromise;
+      await this.archivedScanPromise.catch(() => {});
     }
     // Re-read after the (possible) await — populateArchivedCache may have
     // populated the cache, or thrown without populating. In the latter
@@ -340,30 +344,31 @@ export class SessionManager {
       }
     }
     const jsonlPath = join(this.opts.sessionsDir, `${oakridgeSid}.jsonl`);
-    let unlinkSucceeded = false;
+    // Distinct from "unlink resolved without throwing": only true when
+    // unlink actually deleted a file (ENOENT does NOT set this). Used
+    // below for the cache-null edge case so a bogus sid that ENOENTs
+    // can't be reported as a successful removal.
+    let unlinkDeletedFile = false;
     try {
       await unlink(jsonlPath);
-      unlinkSucceeded = true;
+      unlinkDeletedFile = true;
     } catch (err) {
       const code =
         err && typeof err === "object" && "code" in err
           ? (err as { code: string }).code
           : null;
-      if (code === "ENOENT") {
-        // Already gone — equivalent to a successful unlink for our purposes
-        // (the file may have belonged to an in-memory-only session that
-        // never wrote anything, or a prior remove that landed mid-flight).
-        unlinkSucceeded = true;
-      } else {
+      if (code !== "ENOENT") {
         // Real failure (EACCES, EBUSY, EIO, ...). Leave the in-memory map
         // entry alone — the subprocess is already dead from the abort
         // above, but the operator can still see a stuck row and retry.
         // Do NOT broadcast session_removed; do NOT evict from cache.
         throw new RemoveFailedError(oakridgeSid, jsonlPath, err);
       }
+      // ENOENT — file was already gone. Resolved without throwing, but
+      // we did not actually delete anything; unlinkDeletedFile stays false.
     }
-    // Past this point we've confirmed the JSONL is gone. Now (and only
-    // now) reflect that in our in-memory state.
+    // Past this point: unlink succeeded OR ENOENT (file already absent).
+    // Reflect the new state in our in-memory bookkeeping.
     let removed = false;
     if (session) {
       this.sessions.delete(oakridgeSid);
@@ -371,14 +376,14 @@ export class SessionManager {
       removed = true;
     }
     if (this.archivedSnapshotCache?.delete(oakridgeSid)) removed = true;
-    if (unlinkSucceeded && !removed) {
-      // Sid wasn't in memory and wasn't in the archived cache, but we
-      // unlinked something (or ENOENT'd). Treat as removed if the cache
-      // hadn't been populated yet — common when the operator clicks
-      // Remove on an archived row and it's the very first list call.
-      // ENOENT-only with neither map nor cache hit means the sid was
-      // bogus and we touched nothing.
-      if (this.archivedSnapshotCache === null) removed = true;
+    if (!removed && unlinkDeletedFile && this.archivedSnapshotCache === null) {
+      // First-call edge: cache hasn't been populated yet, sid wasn't in
+      // memory, but unlink really removed a file from disk — treat that
+      // as a successful removal so the operator's Remove click on an
+      // archived-on-disk row right after server boot is honored. ENOENT
+      // is intentionally excluded so a typo'd sid doesn't get a
+      // false-positive "removed" response.
+      removed = true;
     }
     if (removed) {
       this.broadcastDelta({ type: "session_removed", sid: oakridgeSid });

@@ -747,10 +747,16 @@ app.post("/sessions", async (c) => {
         if (typeof parsed.name !== "string") {
           return c.json({ error: "name must be a string" }, 400);
         }
-        if (parsed.name.length > 80) {
-          return c.json({ error: "name must be ≤ 80 chars" }, 400);
+        // Validate after trimming so leading/trailing whitespace can't
+        // push an otherwise-valid name past the cap. All-whitespace
+        // trims to empty, which manager.create()'s slug fallback
+        // handles the same as an omitted name, so we just store the
+        // trimmed value (possibly empty) and let create() decide.
+        const trimmedName = parsed.name.trim();
+        if (trimmedName.length > 80) {
+          return c.json({ error: "name must be ≤ 80 chars after trimming" }, 400);
         }
-        bodyName = parsed.name;
+        bodyName = trimmedName;
       }
     }
   } catch {
@@ -917,12 +923,17 @@ app.delete("/sessions/:sid", async (c) => {
   // it, the existing abort-only semantic is preserved so the PWA's Stop
   // button keeps the ended transcript visible. Treat any non-falsy value
   // as truthy ("1", "true", "yes") to match common URL convention.
-  const purgeParam = c.req.query("purge");
+  // Lowercase once so falsy variants like ?purge=False / FALSE / NO are
+  // recognized — without this, mixed-case spellings would unexpectedly
+  // trigger a hard delete.
+  const purgeParam = c.req.query("purge")?.toLowerCase();
   const purge =
     purgeParam !== undefined &&
     purgeParam !== "" &&
     purgeParam !== "0" &&
-    purgeParam !== "false";
+    purgeParam !== "false" &&
+    purgeParam !== "no" &&
+    purgeParam !== "off";
   if (purge) {
     let removed: boolean;
     try {
