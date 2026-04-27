@@ -191,10 +191,12 @@ function useInbox(opts: { onSessionRemoved?: (sid: string) => void } = {}): Inbo
   // Mirror onSessionRemoved into a ref so the EventSource handler (set up
   // once on mount) reads the latest closure on each delta — otherwise it
   // would call a stale callback that captured the initial render's sid.
+  // Assign during render rather than in a passive useEffect so there's no
+  // window between a re-render and the effect firing where a delta could
+  // hit the previous callback. Mutating a ref during render is sanctioned
+  // by the React docs for exactly this "always-fresh callback" pattern.
   const onSessionRemovedRef = useRef(opts.onSessionRemoved);
-  useEffect(() => {
-    onSessionRemovedRef.current = opts.onSessionRemoved;
-  });
+  onSessionRemovedRef.current = opts.onSessionRemoved;
 
   const hydrateSession = useCallback((snapshot: SessionSnapshot) => {
     setSessions((prev) => {

@@ -212,18 +212,26 @@ export class SessionManager {
   async listArchivedSnapshots(): Promise<SessionSnapshot[]> {
     // Cold path: if the cache hasn't been populated yet, kick off (or
     // join) the single-flight scan. All concurrent callers await the same
-    // promise so the readdir+parse pass runs once. We swallow rejection
+    // promise so the readdir+parse pass runs once. We catch rejection
     // here so a transient scan failure surfaces as an empty list rather
     // than a 500 from /sessions?include=archived; the .finally() in the
     // launch site already clears archivedScanPromise so the next call
-    // retries the scan from scratch.
+    // retries the scan from scratch. Logged (not silently swallowed) so
+    // a real EACCES/I/O error on sessionsDir is diagnosable in server
+    // logs instead of looking like "no archived sessions".
     if (this.archivedSnapshotCache === null) {
       if (this.archivedScanPromise === null) {
         this.archivedScanPromise = this.populateArchivedCache().finally(() => {
           this.archivedScanPromise = null;
         });
       }
-      await this.archivedScanPromise.catch(() => {});
+      await this.archivedScanPromise.catch((err) => {
+        console.error(
+          `cc-deck: archived snapshot scan failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
     }
     // Re-read after the (possible) await — populateArchivedCache may have
     // populated the cache, or thrown without populating. In the latter
@@ -301,10 +309,12 @@ export class SessionManager {
    * map, removes its JSONL from disk, and broadcasts session_removed.
    * Works on archived-only sids too (not in memory) — those just delete the
    * JSONL. Returns true if anything was removed (file or map entry), false
-   * if the sid was unknown to both. Throws RemoveFailedError if the JSONL
-   * exists but unlink fails for any reason other than ENOENT, so the route
-   * handler can return 5xx instead of advertising a successful purge while
-   * the transcript is still on disk.
+   * if the sid was unknown to both. Throws RemoveFailedError if unlink
+   * fails for any reason other than ENOENT, so the route handler can
+   * return 5xx instead of advertising a successful purge while removal
+   * of the transcript could not be confirmed (an EACCES on the parent
+   * directory, for example, fails before we'd know whether the file
+   * existed).
    *
    * Order of operations:
    *  1. Wait for any in-flight archived scan so we operate on a consistent
@@ -315,9 +325,11 @@ export class SessionManager {
    *  3. Unlink the JSONL. ENOENT = already gone = success. Any other error
    *     is propagated; the in-memory map entry stays put so a retry can
    *     finish the job.
-   *  4. On unlink success, evict from cache + drop map entry + broadcast.
-   *     Cache eviction explicitly does NOT contribute to the success
-   *     contract — only successful unlink does.
+   *  4. After unlink success (or ENOENT), evict from cache + drop map
+   *     entry + broadcast. These in-memory removals are part of the
+   *     "anything was removed" return contract; this step just does not
+   *     run if unlink fails for a non-ENOENT reason (we throw before
+   *     reaching it).
    */
   async remove(oakridgeSid: string): Promise<boolean> {
     if (this.archivedScanPromise) {

@@ -940,12 +940,15 @@ app.delete("/sessions/:sid", async (c) => {
       removed = await manager.remove(sid);
     } catch (err) {
       if (err instanceof RemoveFailedError) {
-        // JSONL exists but unlink failed (EACCES/EBUSY/EIO/etc). Surface
-        // as 500 so the client doesn't see a misleading "removed:true" —
-        // the transcript is still on disk and would reappear after
-        // restart.
+        // unlink failed for a non-ENOENT reason (EACCES/EBUSY/EIO/etc).
+        // Surface as 500 so the client doesn't see a misleading
+        // "removed:true" — the transcript may still be on disk and would
+        // reappear after restart. The full message (with JSONL path) is
+        // logged server-side; the response body intentionally omits the
+        // path since the server runs on 0.0.0.0 (tailnet) and we don't
+        // want to disclose filesystem layout to anyone who can hit it.
         console.error(`cc-deck: ${err.message}`);
-        return c.json({ error: "purge failed", detail: err.message }, 500);
+        return c.json({ error: "purge failed" }, 500);
       }
       throw err;
     }
