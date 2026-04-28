@@ -912,13 +912,27 @@ function SessionView({
         }
       }
       // Replayed user input echoed by CC (--replay-user-messages) — drop
-      // the matching optimistic bubble so we don't show it twice.
+      // the matching optimistic bubble so we don't show it twice. For
+      // slash commands CC echoes the expanded <command-message> blob, not
+      // the original `/name args` invocation, so reconstruct that form
+      // and also match on it; otherwise the bubble lingers forever and
+      // keeps the thinking indicator stuck on.
       if (evt.type === "user") {
         const p = evt.payload as CCUserPayload;
         const content = p.message?.content;
         if (typeof content === "string") {
+          const slash = parseSlashCommand(content);
+          const reconstructed = slash
+            ? slash.args
+              ? `/${slash.name} ${slash.args}`
+              : `/${slash.name}`
+            : null;
           setPendingMessages((prev) => {
-            const idx = prev.findIndex((m) => m.text === content);
+            const idx = prev.findIndex(
+              (m) =>
+                m.text === content ||
+                (reconstructed !== null && m.text === reconstructed),
+            );
             if (idx === -1) return prev;
             const next = prev.slice();
             next.splice(idx, 1);
