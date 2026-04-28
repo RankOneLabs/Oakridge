@@ -922,16 +922,23 @@ function SessionView({
         const content = p.message?.content;
         if (typeof content === "string") {
           const slash = parseSlashCommand(content);
+          // Normalize whitespace so `/foo  bar` (typed) still matches
+          // `/foo bar` (reconstructed) — parseSlashCommand collapses
+          // inner spacing on its way out.
+          const normalizeWs = (s: string) => s.replace(/\s+/g, " ").trim();
           const reconstructed = slash
             ? slash.args
               ? `/${slash.name} ${slash.args}`
               : `/${slash.name}`
             : null;
+          const normalizedReconstructed =
+            reconstructed === null ? null : normalizeWs(reconstructed);
           setPendingMessages((prev) => {
             const idx = prev.findIndex(
               (m) =>
                 m.text === content ||
-                (reconstructed !== null && m.text === reconstructed),
+                (normalizedReconstructed !== null &&
+                  normalizeWs(m.text) === normalizedReconstructed),
             );
             if (idx === -1) return prev;
             const next = prev.slice();
