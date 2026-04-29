@@ -6,6 +6,7 @@
   "description": "Mobile command center for Claude Code",
   "scripts": {
     "dev": "bun run --hot server.ts",
+    "prestart": "bun run build:pwa",
     "start": "bun run server.ts",
     "build:pwa": "cd pwa && vite build",
     "dev:pwa": "cd pwa && vite",

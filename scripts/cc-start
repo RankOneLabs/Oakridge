@@ -18,4 +18,9 @@ fi
 WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Rebuild the PWA bundle so a fresh `git pull` doesn't silently serve a
+# stale pwa/dist. Vite is fast (~1s) and the dist is required to serve
+# anything useful, so eat the cost unconditionally.
+(cd "$REPO_ROOT" && bun run build:pwa)
+
 exec bun run "$REPO_ROOT/server.ts" --workdir="$WORKDIR_ABS" "$@"
