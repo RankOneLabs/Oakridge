@@ -52,7 +52,7 @@ If you want to bound resource use (shared box, or a box hosting other workloads)
 ```bash
 systemd-run --user --scope --unit=cc-deck \
   -p MemoryMax=2G -p CPUQuota=200% \
-  bun run server.ts --workdir=/path/to/your/repo
+  ./scripts/cc-start /path/to/your/repo
 ```
 
 Stop with `systemctl --user stop cc-deck`. Not needed on a dedicated workstation.
