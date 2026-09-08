@@ -111,7 +111,7 @@ describe("AddSpecModal split role selection", () => {
 
     expect(screen.getByLabelText("Planner model")).toHaveProperty("value", "gpt-5.6-sol");
     expect(screen.getByLabelText("Worker runtime")).toHaveProperty("value", "codex");
-    expect(screen.getByLabelText("Worker model")).toHaveProperty("value", "gpt-5.6-luna");
+    expect(screen.getByLabelText("Worker model")).toHaveProperty("value", "gpt-5.6-sol");
 
     fireEvent.change(screen.getByLabelText("Title"), {
       target: { value: "Build the thing" },
@@ -123,7 +123,7 @@ describe("AddSpecModal split role selection", () => {
         project_id: "project-1",
         title: "Build the thing",
         planner_model_selection: { runtime: "codex", model: "gpt-5.6-sol" },
-        worker_model_selection: { runtime: "codex", model: "gpt-5.6-luna" },
+        worker_model_selection: { runtime: "codex", model: "gpt-5.6-sol" },
       });
     });
     expect(Object.keys(postBody as Record<string, unknown>).sort()).toEqual([
@@ -239,7 +239,7 @@ describe("AddSpecModal split role selection", () => {
       "claude-sonnet-4-6",
     ]);
     expect(screen.getByLabelText("Worker runtime")).toHaveProperty("value", "codex");
-    expect(screen.getByLabelText("Worker model")).toHaveProperty("value", "gpt-5.6-luna");
+    expect(screen.getByLabelText("Worker model")).toHaveProperty("value", "gpt-5.6-sol");
     expect(getSelectOptions(screen.getByLabelText("Worker model") as HTMLSelectElement)).toEqual([
       "gpt-5.6-sol",
       "gpt-5.6-terra",
@@ -257,7 +257,7 @@ describe("AddSpecModal split role selection", () => {
     await waitFor(() => {
       expect(screen.getByLabelText("Worker runtime")).toHaveProperty("value", "claude-code");
     });
-    expect(screen.getByLabelText("Worker model")).toHaveProperty("value", "claude-sonnet-4-6");
+    expect(screen.getByLabelText("Worker model")).toHaveProperty("value", "claude-opus-4-8");
     expect(screen.getByLabelText("Planner runtime")).toHaveProperty("value", "claude-code");
     expect(screen.getByLabelText("Planner model")).toHaveProperty("value", "claude-opus-4-8");
   });
@@ -379,7 +379,7 @@ describe("AddSpecModal split role selection", () => {
         title: "From a file",
         notes: "manual notes",
         planner_model_selection: { runtime: "codex", model: "gpt-5.6-sol" },
-        worker_model_selection: { runtime: "codex", model: "gpt-5.6-luna" },
+        worker_model_selection: { runtime: "codex", model: "gpt-5.6-sol" },
       });
     });
   });

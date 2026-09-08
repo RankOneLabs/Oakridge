@@ -1,11 +1,7 @@
+import { RUNTIME_MODELS } from "../../runtime";
+
 export const PWA_MODEL_OPTIONS = [
-  { value: "claude-fable-5", label: "fable 5" },
-  { value: "claude-opus-5", label: "opus 5" },
-  { value: "claude-sonnet-5", label: "sonnet 5" },
-  { value: "claude-sonnet-4-6", label: "sonnet 4.6" },
-  { value: "claude-opus-4-8", label: "opus 4.8" },
-  { value: "claude-opus-4-7", label: "opus 4.7" },
-  { value: "claude-haiku-4-5-20251001", label: "haiku 4.5" },
+  ...RUNTIME_MODELS["claude-code"],
   { value: "", label: "default" },
 ] as const;
 

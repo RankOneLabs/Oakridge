@@ -43,6 +43,11 @@ import { mountArtifactStreamRoutes } from "./handlers/artifact-stream";
 import { artifactEventBus } from "../stream/artifact-event-bus";
 import { mountSkillsRoutes } from "../skills/routes";
 import { mountOakridgeProxyRoutes } from "./handlers/oakridge-proxy";
+import {
+  isRuntimeId,
+  RUNTIME_EFFORTS,
+  RUNTIME_MODELS,
+} from "../runtime";
 
 export interface CreateAppDeps {
   /**
@@ -151,10 +156,9 @@ export function createApp(deps: CreateAppDeps): Hono {
   // PATCH /config allows runtime mutation of soft_threshold_tokens, persisted
   // back to configPath so the value survives a server restart.
   app.get("/config", (c) => {
-    // Model/effort lists are no longer static kbbl knowledge (§12): each
-    // agent exposes them per-session via ACP config options. The runtime
-    // descriptors here keep the PWA's new-session form rendering until it
-    // consumes ACP config options directly.
+    // A launch form exists before an ACP session can report config options,
+    // so built-in profiles need a launch catalog. After session creation the
+    // agent-reported ACP config options remain authoritative.
     return c.json({
       defaultWorkdir,
       softThresholdTokens: config.compact.soft_threshold_tokens,
@@ -162,13 +166,24 @@ export function createApp(deps: CreateAppDeps): Hono {
       runtimes: acp
         .listProfiles()
         .filter((profile) => profile.enabled)
-        .map((profile) => ({
-          id: profile.id,
-          label: profile.label,
-          models: [],
-          efforts: [],
-          supportsCompaction: false,
-        })),
+        .map((profile) => {
+          if (!isRuntimeId(profile.id)) {
+            return {
+              id: profile.id,
+              label: profile.label,
+              models: [],
+              efforts: [],
+              supportsCompaction: false,
+            };
+          }
+          return {
+            id: profile.id,
+            label: profile.label,
+            models: RUNTIME_MODELS[profile.id],
+            efforts: RUNTIME_EFFORTS[profile.id],
+            supportsCompaction: false,
+          };
+        }),
     });
   });
 
