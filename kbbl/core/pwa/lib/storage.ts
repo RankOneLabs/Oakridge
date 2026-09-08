@@ -1,5 +1,6 @@
 import type { Theme } from "../types";
 import type { RuntimeDescriptor } from "../types";
+import { defaultModelForRuntime } from "../../runtime";
 
 export const THEME_STORAGE_KEY = "oakridge.theme";
 /**
@@ -26,16 +27,10 @@ export function isValidNewSessionModelForRuntime(
 }
 
 export function defaultNewSessionModelForRuntime(runtime: RuntimeDescriptor): string {
-  // First-mount default: cost-engineering nudge per the design doc —
-  // make sonnet the implicit choice so absent-minded "+ New" clicks
-  // route to Sonnet pricing.
-  if (
-    runtime.id === "claude-code" &&
-    runtime.models.some((o) => o.value === "claude-sonnet-4-6")
-  ) {
-    return "claude-sonnet-4-6";
-  }
-  return "";
+  const preferred = defaultModelForRuntime(runtime.id);
+  return runtime.models.some((option) => option.value === preferred)
+    ? preferred
+    : "";
 }
 
 export function normalizeNewSessionModelForRuntime(

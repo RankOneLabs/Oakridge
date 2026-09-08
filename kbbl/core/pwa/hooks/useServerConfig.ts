@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { RuntimeId } from "../../runtime-interface";
+import { isRuntimeId, type RuntimeId } from "../../runtime-interface";
 import type { RuntimeDescriptor, RuntimeModelOption } from "../types";
 import { PWA_MODEL_OPTIONS } from "../lib/format";
 
@@ -33,10 +33,6 @@ export function defaultRuntimeIdForConfig(serverConfig: ServerConfig | null): Ru
   const runtimes = runtimeDescriptorsForConfig(serverConfig);
   const rawId = serverConfig?.defaultRuntimeId;
   return rawId && runtimes.some((runtime) => runtime.id === rawId) ? rawId : runtimes[0].id;
-}
-
-function isRuntimeId(value: unknown): value is RuntimeId {
-  return value === "claude-code" || value === "codex";
 }
 
 function fallbackClaudeDescriptor(): RuntimeDescriptor {

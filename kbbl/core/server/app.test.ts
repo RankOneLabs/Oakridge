@@ -80,7 +80,7 @@ describe("GET /config", () => {
     expect(body.softThresholdTokens).toBe(config.compact.soft_threshold_tokens);
   });
 
-  test("returns ACP profile descriptors with empty model lists (§12)", async () => {
+  test("returns launch choices for built-in ACP profiles", async () => {
     const acp = makeStubAcp(
       [
         { id: "claude-code", label: "Claude Code (ACP)", enabled: true },
@@ -105,12 +105,27 @@ describe("GET /config", () => {
       }>;
     };
     expect(body.defaultRuntimeId).toBe("codex");
-    // Model/effort lists are per-session ACP config options now, never
-    // static kbbl knowledge — the descriptors carry identity only.
-    expect(body.runtimes).toEqual([
-      { id: "claude-code", label: "Claude Code (ACP)", models: [], efforts: [], supportsCompaction: false },
-      { id: "codex", label: "Codex (ACP)", models: [], efforts: [], supportsCompaction: false },
-    ]);
+    expect(body.runtimes).toHaveLength(2);
+    expect(body.runtimes[0]).toMatchObject({
+      id: "claude-code",
+      label: "Claude Code (ACP)",
+      supportsCompaction: false,
+    });
+    expect(body.runtimes[0]?.models).toContainEqual({
+      value: "claude-fable-5-1",
+      label: "fable 5.1",
+    });
+    expect(body.runtimes[0]?.efforts).toContainEqual({ value: "max", label: "max" });
+    expect(body.runtimes[1]).toMatchObject({
+      id: "codex",
+      label: "Codex (ACP)",
+      supportsCompaction: false,
+    });
+    expect(body.runtimes[1]?.models).toContainEqual({
+      value: "gpt-6-astra",
+      label: "gpt-6 astra",
+    });
+    expect(body.runtimes[1]?.efforts).toContainEqual({ value: "minimal", label: "minimal" });
   });
 
   test("allows a null defaultWorkdir", async () => {

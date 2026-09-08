@@ -6,32 +6,22 @@ import {
   writeStoredNewSessionModel,
 } from "./storage";
 import type { RuntimeDescriptor } from "../types";
+import { RUNTIME_EFFORTS, RUNTIME_MODELS } from "../../runtime";
 
 const claudeRuntime: RuntimeDescriptor = {
   id: "claude-code",
   label: "Claude Code",
   supportsCompaction: true,
-  models: [
-    { value: "claude-sonnet-4-6", label: "sonnet 4.6" },
-    { value: "claude-opus-4-7", label: "opus 4.7" },
-  ],
-  efforts: [
-    { value: "medium", label: "medium" },
-    { value: "high", label: "high" },
-  ],
+  models: [...RUNTIME_MODELS["claude-code"]],
+  efforts: [...RUNTIME_EFFORTS["claude-code"]],
 };
 
 const codexRuntime: RuntimeDescriptor = {
   id: "codex",
   label: "Codex",
   supportsCompaction: false,
-  models: [
-    { value: "gpt-5.1-codex", label: "gpt-5.1-codex" },
-  ],
-  efforts: [
-    { value: "low", label: "low" },
-    { value: "high", label: "high" },
-  ],
+  models: [...RUNTIME_MODELS.codex],
+  efforts: [...RUNTIME_EFFORTS.codex],
 };
 
 class MemoryStorage {
@@ -72,36 +62,41 @@ afterEach(() => {
 
 describe("new session model storage", () => {
   test("preserves supported Codex model writes", () => {
-    const normalized = writeStoredNewSessionModel("gpt-5.1-codex", codexRuntime);
+    const normalized = writeStoredNewSessionModel("gpt-5.6-sol", codexRuntime);
 
-    expect(normalized).toBe("gpt-5.1-codex");
-    expect(localStorage.getItem(newSessionModelKey("codex"))).toBe("gpt-5.1-codex");
-    expect(readStoredNewSessionModel(codexRuntime)).toBe("gpt-5.1-codex");
+    expect(normalized).toBe("gpt-5.6-sol");
+    expect(localStorage.getItem(newSessionModelKey("codex"))).toBe("gpt-5.6-sol");
+    expect(readStoredNewSessionModel(codexRuntime)).toBe("gpt-5.6-sol");
   });
 
   test("coerces unsupported model writes to runtime default", () => {
     const normalized = writeStoredNewSessionModel("claude-sonnet-4-6", codexRuntime);
 
-    expect(normalized).toBe("");
-    expect(localStorage.getItem(newSessionModelKey("codex"))).toBe("");
-    expect(readStoredNewSessionModel(codexRuntime)).toBe("");
+    expect(normalized).toBe("gpt-5.6-sol");
+    expect(localStorage.getItem(newSessionModelKey("codex"))).toBe("gpt-5.6-sol");
+    expect(readStoredNewSessionModel(codexRuntime)).toBe("gpt-5.6-sol");
   });
 
   test("preserves supported Claude model writes", () => {
-    const normalized = writeStoredNewSessionModel("claude-opus-4-7", claudeRuntime);
+    const normalized = writeStoredNewSessionModel("claude-opus-5", claudeRuntime);
 
-    expect(normalized).toBe("claude-opus-4-7");
+    expect(normalized).toBe("claude-opus-5");
     expect(localStorage.getItem(newSessionModelKey("claude-code"))).toBe(
-      "claude-opus-4-7",
+      "claude-opus-5",
     );
-    expect(readStoredNewSessionModel(claudeRuntime)).toBe("claude-opus-4-7");
+    expect(readStoredNewSessionModel(claudeRuntime)).toBe("claude-opus-5");
   });
 
   test("stores runtime preferences independently", () => {
-    writeStoredNewSessionModel("claude-opus-4-7", claudeRuntime);
-    writeStoredNewSessionModel("gpt-5.1-codex", codexRuntime);
+    writeStoredNewSessionModel("claude-opus-5", claudeRuntime);
+    writeStoredNewSessionModel("gpt-5.6-sol", codexRuntime);
 
-    expect(readStoredNewSessionModel(claudeRuntime)).toBe("claude-opus-4-7");
-    expect(readStoredNewSessionModel(codexRuntime)).toBe("gpt-5.1-codex");
+    expect(readStoredNewSessionModel(claudeRuntime)).toBe("claude-opus-5");
+    expect(readStoredNewSessionModel(codexRuntime)).toBe("gpt-5.6-sol");
+  });
+
+  test("uses Opus and Sol when no preference is stored", () => {
+    expect(readStoredNewSessionModel(claudeRuntime)).toBe("claude-opus-5");
+    expect(readStoredNewSessionModel(codexRuntime)).toBe("gpt-5.6-sol");
   });
 });
